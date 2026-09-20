@@ -349,6 +349,25 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         return False
 
     @staticmethod
+    def _is_wireless_fd(fd: int) -> bool:
+        """Return True if the open hidraw *fd* belongs to the 2.4GHz dongle (PID 0x4011).
+
+        Reads /proc/self/fd/<fd> -> resolves to /dev/hidrawN, then checks the
+        corresponding sysfs uevent for PID 4011.  Falls back to False on any
+        error so the wired code-path is never broken.
+        """
+        try:
+            dev_path = os.readlink(f"/proc/self/fd/{fd}")
+            hidraw_name = os.path.basename(dev_path)
+            uevent_path = f"/sys/class/hidraw/{hidraw_name}/device/uevent"
+            if os.path.exists(uevent_path):
+                with open(uevent_path, "r") as f:
+                    return "4011" in f.read()
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
     def _apply_checksum(payload: bytearray, checksum_type: str = "bit7") -> bytearray:
         """Apply one's-complement checksum to a 64-byte payload.
 
@@ -367,7 +386,23 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         return payload
 
     def _send_feature_report(self, payload: bytes, checksum_type: Optional[str] = "bit7") -> bool:
-        """Send a 65-byte HID feature report to the keyboard (byte 0 = 0x00 Report ID)."""
+        """Send a 65-byte HID feature report to the keyboard (byte 0 = 0x00 Report ID).
+
+        For the 2.4GHz wireless dongle (PID 0x4011) the YC3121 RF firmware requires a
+        two-step transaction (reverse-engineered from iot_driver.exe, function at VA
+        0x56ab90, states 0 → 3):
+
+          Step 1 – "fe_24_set_next_pack_length":
+            Send a 65-byte feature report whose payload is:
+              byte[0] = 0xFE  (dongle routing marker)
+              byte[1] = payload_length (always 64 for a full command)
+              bytes[2..63] = 0x00
+            This tells the RF dongle how many bytes follow in the next frame.
+
+          Step 2 – send the actual command payload (same 65-byte frame as wired).
+
+        The wired path (PID 0x4015) sends only Step 2 as before, unchanged.
+        """
         dev = self.dev_path or self.find_device()
         if not dev or not os.path.exists(dev):
             return False
@@ -387,6 +422,16 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         try:
             fd = os.open(dev, os.O_RDWR)
             try:
+                # Wireless dongle (3151:4011) requires a length-prefix packet first
+                if self._is_wireless_fd(fd):
+                    prefix = bytearray(65)
+                    prefix[0] = 0x00   # HID Report ID
+                    prefix[1] = 0xFE   # YC3121 dongle routing marker
+                    prefix[2] = 64     # payload_length that follows
+                    # bytes[3..64] = 0x00 (already zeroed)
+                    fcntl.ioctl(fd, _HIDIOCSFEATURE(65), prefix)
+                    time.sleep(0.005)   # ~5 ms inter-frame gap observed in USB traces
+
                 ret = fcntl.ioctl(fd, _HIDIOCSFEATURE(65), buf)
                 return ret == 65 or (isinstance(ret, bytes) and len(ret) == 65)
             finally:
@@ -403,6 +448,9 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
 
         1. Populates buf[0] = 0x00 (Report ID), buf[1] = cmd, calculates checksum, and sends via _HIDIOCSFEATURE(length).
         2. Reads the response into read_buf via _HIDIOCGFEATURE(length).
+
+        For the 2.4GHz wireless dongle (PID 0x4011), a [0xFE, payload_len] prefix frame
+        is sent before the query payload (same two-step protocol as _send_feature_report).
         """
         dev = self.dev_path or self.find_device()
         if not dev or not os.path.exists(dev):
@@ -420,6 +468,15 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         try:
             fd = os.open(dev, os.O_RDWR)
             try:
+                # Wireless dongle (3151:4011) requires a length-prefix packet before each write
+                if self._is_wireless_fd(fd):
+                    prefix = bytearray(65)
+                    prefix[0] = 0x00   # HID Report ID
+                    prefix[1] = 0xFE   # YC3121 dongle routing marker
+                    prefix[2] = 64     # payload_length that follows
+                    fcntl.ioctl(fd, _HIDIOCSFEATURE(65), prefix)
+                    time.sleep(0.005)
+
                 fcntl.ioctl(fd, _HIDIOCSFEATURE(length), buf)
                 time.sleep(0.02)
                 read_buf = bytearray(length)
@@ -434,6 +491,7 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         except Exception as e:
             print(f"Erreur de lecture de rapport HID: {e}", file=sys.stderr)
             return None
+
 
     # =========================================================================
     # Configuration Persistence

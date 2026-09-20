@@ -394,6 +394,153 @@ class TestDriverMethods(unittest.TestCase):
         self.assertEqual(dev, "/dev/hidraw2")
 
 
+class TestWirelessProtocol(unittest.TestCase):
+    """Tests du protocole 2-étapes 0xFE pour le dongle 2.4GHz (PID 0x4011).
+
+    Le dongle YC3121 exige qu'avant chaque payload de commande on envoie un
+    rapport de préfixe : [0x00, 0xFE, payload_len, 0, ..., 0] (65 octets).
+    Le vrai payload est envoyé immédiatement après.
+    Chemin de code reverse-engineered depuis iot_driver.exe, VA 0x56ab90.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.orig_config_dir = keyboard.CONFIG_DIR
+        self.orig_profile_file = keyboard.DEFAULT_PROFILE_FILE
+        keyboard.CONFIG_DIR = self.temp_dir.name
+        keyboard.DEFAULT_PROFILE_FILE = os.path.join(self.temp_dir.name, "default_profile.json")
+
+    def tearDown(self):
+        keyboard.CONFIG_DIR = self.orig_config_dir
+        keyboard.DEFAULT_PROFILE_FILE = self.orig_profile_file
+        self.temp_dir.cleanup()
+
+    @patch.object(SkillkorpK20Driver, "_is_wireless_fd", return_value=True)
+    @patch.object(SkillkorpK20Driver, "find_device", return_value="/dev/hidraw_test")
+    @patch("os.path.exists", return_value=True)
+    @patch("os.open", return_value=42)
+    @patch("os.close")
+    @patch("fcntl.ioctl", return_value=65)
+    def test_wireless_send_sends_prefix_first(self, mock_ioctl, mock_close, mock_open_fd,
+                                               mock_exists, mock_find, mock_is_wireless):
+        """_send_feature_report doit envoyer [0x00, 0xFE, 64, ...] avant le payload réel."""
+        driver = SkillkorpK20Driver()
+        result = driver.set_polling_rate(500)
+        self.assertTrue(result)
+
+        # Au moins 2 appels ioctl : préfixe + payload
+        self.assertGreaterEqual(mock_ioctl.call_count, 2)
+
+        # Premier appel = paquet préfixe 0xFE
+        first_call_args = mock_ioctl.call_args_list[0][0]
+        prefix_buf = first_call_args[2]
+        self.assertEqual(prefix_buf[0], 0x00,  "Report ID doit être 0x00")
+        self.assertEqual(prefix_buf[1], 0xFE,  "Octet 1 = 0xFE (marqueur dongle YC3121)")
+        self.assertEqual(prefix_buf[2], 64,    "Octet 2 = longueur payload (64)")
+        # Le reste doit être zéro
+        for i in range(3, 65):
+            self.assertEqual(prefix_buf[i], 0, f"prefix_buf[{i}] doit être 0")
+
+        # Deuxième appel = payload CMD_SET_REPORT avec checksum correct
+        second_call_args = mock_ioctl.call_args_list[1][0]
+        cmd_buf = second_call_args[2]
+        self.assertEqual(cmd_buf[0], 0x00)
+        self.assertEqual(cmd_buf[1], CMD_SET_REPORT)
+
+    @patch.object(SkillkorpK20Driver, "_is_wireless_fd", return_value=False)
+    @patch.object(SkillkorpK20Driver, "find_device", return_value="/dev/hidraw_test")
+    @patch("os.path.exists", return_value=True)
+    @patch("os.open", return_value=42)
+    @patch("os.close")
+    @patch("fcntl.ioctl", return_value=65)
+    def test_wired_send_no_prefix(self, mock_ioctl, mock_close, mock_open_fd,
+                                   mock_exists, mock_find, mock_is_wireless):
+        """En mode filaire, _send_feature_report ne doit envoyer qu'un seul ioctl (le payload)."""
+        driver = SkillkorpK20Driver()
+        result = driver.set_polling_rate(500)
+        self.assertTrue(result)
+
+        # Un seul appel ioctl : pas de préfixe
+        self.assertEqual(mock_ioctl.call_count, 1, "Mode filaire: un seul ioctl attendu")
+        args = mock_ioctl.call_args_list[0][0]
+        buf = args[2]
+        self.assertEqual(buf[0], 0x00)
+        self.assertEqual(buf[1], CMD_SET_REPORT)
+
+    @patch.object(SkillkorpK20Driver, "_is_wireless_fd", return_value=True)
+    @patch.object(SkillkorpK20Driver, "is_wireless", return_value=True)
+    @patch.object(SkillkorpK20Driver, "is_connected", return_value=True)
+    @patch.object(SkillkorpK20Driver, "find_device", return_value="/dev/hidraw_test")
+    @patch("os.path.exists", return_value=True)
+    @patch("os.open", return_value=42)
+    @patch("os.close")
+    @patch("fcntl.ioctl")
+    def test_wireless_read_feature_sends_prefix_before_query(
+            self, mock_ioctl, mock_close, mock_open_fd,
+            mock_exists, mock_find, mock_conn, mock_wl, mock_is_wireless_fd):
+        """_read_feature_report doit envoyer le préfixe 0xFE avant la requête en mode wireless."""
+        driver = SkillkorpK20Driver()
+
+        ioctl_calls = []
+
+        def fake_ioctl(fd, req, buf):
+            ioctl_calls.append((req, bytes(buf)))
+            if req == _HIDIOCGFEATURE(65):
+                buf[1] = CMD_GET_BATTERY
+                buf[2] = 75
+                buf[3] = 0
+            return 65
+
+        mock_ioctl.side_effect = fake_ioctl
+        driver.get_battery()
+
+        send_reqs = [c[0] for c in ioctl_calls if c[0] == _HIDIOCSFEATURE(65)]
+        # Au moins 2 HIDIOCSFEATURE: 1 préfixe + 1 requête
+        self.assertGreaterEqual(len(send_reqs), 2,
+                                "En mode wireless, au moins 2 HIDIOCSFEATURE attendus (préfixe + requête)")
+
+        # Le premier HIDIOCSFEATURE doit être le préfixe 0xFE
+        first_send_buf = next(b for r, b in ioctl_calls if r == _HIDIOCSFEATURE(65))
+        self.assertEqual(first_send_buf[1], 0xFE, "Premier send doit être le préfixe 0xFE")
+        self.assertEqual(first_send_buf[2], 64,   "Longueur payload dans le préfixe")
+
+    def test_is_wireless_fd_returns_false_on_missing_sysfs(self):
+        """_is_wireless_fd doit retourner False si /proc/self/fd/<n> ne peut pas être lu."""
+        # FD improbable (9999) — readlink va échouer proprement
+        result = SkillkorpK20Driver._is_wireless_fd(9999)
+        self.assertFalse(result)
+
+    @patch("os.readlink", return_value="/dev/hidraw8")
+    @patch("os.path.exists", return_value=True)
+    @patch("builtins.open")
+    def test_is_wireless_fd_detects_pid_4011(self, mock_open_file, mock_exists, mock_readlink):
+        """_is_wireless_fd doit retourner True quand l'uevent contient 4011 (PID dongle)."""
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.read.return_value = "HID_ID=0003:00003151:00004011\n"
+        m.__enter__.return_value = m
+        m.__exit__.return_value = None
+        mock_open_file.return_value = m
+
+        result = SkillkorpK20Driver._is_wireless_fd(8)
+        self.assertTrue(result)
+
+    @patch("os.readlink", return_value="/dev/hidraw16")
+    @patch("os.path.exists", return_value=True)
+    @patch("builtins.open")
+    def test_is_wireless_fd_returns_false_for_pid_4015(self, mock_open_file, mock_exists, mock_readlink):
+        """_is_wireless_fd doit retourner False pour le mode filaire (PID 0x4015)."""
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.read.return_value = "HID_ID=0003:00003151:00004015\n"
+        m.__enter__.return_value = m
+        m.__exit__.return_value = None
+        mock_open_file.return_value = m
+
+        result = SkillkorpK20Driver._is_wireless_fd(16)
+        self.assertFalse(result)
+
+
 class TestProfileManagerKeyboard(unittest.TestCase):
     """Tests du gestionnaire multi-profils unifié, côté clavier."""
 
