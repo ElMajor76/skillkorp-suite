@@ -3,6 +3,30 @@
 Toutes les modifications notables sont documentées dans ce fichier.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 
+## [1.0.1] — 2026-09-20
+
+### Correction du protocole clavier K20 (RGB, verrouillage, remapping...)
+
+- `skillkorp/devices/keyboard.py` : le protocole HID du K20 (SoC Yichip
+  YC3121) tel que porté depuis `k20_driver.py` n'avait en réalité **jamais
+  été validé sur du vrai matériel** — les codes de commande et les offsets de
+  payload étaient faux, et il manquait un checksum complément à un obligatoire
+  (le firmware ignore silencieusement toute trame sans checksum valide).
+  Corrigé après reverse-engineering du logiciel officiel :
+  - Checksum BIT7 (`payload[7]`) pour les commandes standard (debounce,
+    polling rate, options, veille, remap de touches, requêtes) et checksum
+    BIT8 (`payload[8]`) pour les commandes d'éclairage (RGB principal et
+    bandes latérales).
+  - Codes de commande corrigés : `CMD_SET_LEDPARAM` (0x04→0x07),
+    `CMD_SET_REPORT` (0x01→0x04), `CMD_SET_PROFILE` (0x02→0x05),
+    `CMD_SET_RESERT` (0x0A→0x02), et leurs équivalents `GET`.
+  - Index des modes d'éclairage principal/latéral corrigés.
+  - Décalage d'un octet des trames `set_sleep_time`/`remap_key`/
+    `remap_fn_key` pour laisser la place au checksum.
+  - `tests/test_keyboard_driver.py` mis à jour (81 tests, tous verts).
+- Le pilote souris (`skillkorp/devices/mouse.py`) n'est pas concerné par ce
+  correctif.
+
 ## [1.0.0] — 2026-09-20
 
 ### Fusion initiale de skillkorp-k20 et skillkorp-m20

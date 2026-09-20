@@ -14,7 +14,7 @@ import subprocess
 import tarfile
 import hashlib
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 RELEASE = "1"
 PKG_NAME = "skillkorp-suite"
 

@@ -1,6 +1,6 @@
 # Maintainer: nplacide <nplacide95@gmail.com>
 pkgname=skillkorp-suite
-pkgver=1.0.0
+pkgver=1.0.1
 pkgrel=1
 pkgdesc="Unified Linux driver, CLI, and GTK4/Libadwaita GUI for SkillKorp K20 Ultimate keyboard & M20 Ultimate mouse"
 arch=('any')

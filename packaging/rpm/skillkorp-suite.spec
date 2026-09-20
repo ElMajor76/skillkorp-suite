@@ -2,7 +2,7 @@
 %global pkgdir %{_datadir}/skillkorp-suite
 
 Name:           skillkorp-suite
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        Pilote et interface graphique Linux unifiés pour le clavier SkillKorp K20 Ultimate et la souris SkillKorp M20 Ultimate
 License:        MIT
@@ -82,6 +82,11 @@ update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 %{_datadir}/icons/hicolor/256x256/apps/skillkorp-suite.png
 
 %changelog
+* Sun Sep 20 2026 nplacide <nplacide95@gmail.com> - 1.0.1-1
+- Correction du protocole clavier K20 (checksums complément à un, codes de
+  commande et offsets de payload corrigés) : RGB, verrouillage Windows,
+  polling rate, debounce, veille et remapping de touches fonctionnent enfin
+
 * Sun Sep 20 2026 nplacide <nplacide95@gmail.com> - 1.0.0-1
 - Fusion de skillkorp-k20 et skillkorp-m20 en une application unique
 - CLI unifiée skillkorpctl (sous-commandes keyboard/mouse), GUI et tray uniques
