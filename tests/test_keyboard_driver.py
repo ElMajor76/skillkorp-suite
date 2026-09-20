@@ -22,6 +22,7 @@ from skillkorp.devices.keyboard import (
     CMD_SET_REPORT,
     CMD_SET_LEDPARAM,
     CMD_SET_KBOPTION,
+    CMD_SET_SLEDPARAM,
     CMD_SET_RESERT,
     CMD_SET_DEBOUNCE,
     CMD_SET_SLEEPTIME,
@@ -119,13 +120,39 @@ class TestDriverMethods(unittest.TestCase):
         buf = args[2]
         self.assertEqual(buf[0], 0x00)
         self.assertEqual(buf[1], CMD_SET_LEDPARAM)
-        self.assertEqual(buf[2], 3)  # Wave code
+        self.assertEqual(buf[2], 4)  # Wave code in real hardware is 4
         self.assertEqual(buf[3], 1)  # 5 - 4 = 1
         self.assertEqual(buf[4], 3)  # brightness
-        self.assertEqual(buf[5], 1)  # direction
+        self.assertEqual(buf[5], (1 << 4) | 8)  # direction 1 (left) + NORMAL (8) = 24
         self.assertEqual(buf[6], 0)  # R
         self.assertEqual(buf[7], 255)  # G
         self.assertEqual(buf[8], 0)  # B
+        # BIT8 Checksum verification: payload[8] / buf[9] = (~sum(payload[0:8])) & 0xFF
+        expected_csum = (~sum(buf[1:9])) & 0xFF
+        self.assertEqual(buf[9], expected_csum)
+
+    @patch.object(SkillkorpK20Driver, "find_device", return_value="/dev/hidraw_test")
+    @patch("os.path.exists", return_value=True)
+    @patch("os.open", return_value=10)
+    @patch("os.close")
+    @patch("fcntl.ioctl", return_value=65)
+    def test_set_side_rgb(self, mock_ioctl, mock_close, mock_open_fd, mock_exists, mock_find):
+        driver = SkillkorpK20Driver()
+        success = driver.set_side_rgb(mode="rainbow", speed=3, brightness=4, color="#00FFCC")
+        self.assertTrue(success)
+        args, _ = mock_ioctl.call_args
+        buf = args[2]
+        self.assertEqual(buf[0], 0x00)
+        self.assertEqual(buf[1], CMD_SET_SLEDPARAM)
+        self.assertEqual(buf[2], 3)  # Rainbow code is 3
+        self.assertEqual(buf[3], 3)  # speed
+        self.assertEqual(buf[4], 4)  # brightness
+        self.assertEqual(buf[5], 8)  # NORMAL
+        self.assertEqual(buf[6], 0)  # R
+        self.assertEqual(buf[7], 255)  # G
+        self.assertEqual(buf[8], 204)  # B
+        expected_csum = (~sum(buf[1:9])) & 0xFF
+        self.assertEqual(buf[9], expected_csum)
 
     @patch.object(SkillkorpK20Driver, "find_device", return_value="/dev/hidraw_test")
     @patch("os.path.exists", return_value=True)
@@ -139,7 +166,10 @@ class TestDriverMethods(unittest.TestCase):
         args, _ = mock_ioctl.call_args
         buf = args[2]
         self.assertEqual(buf[1], CMD_SET_REPORT)
+        self.assertEqual(buf[2], 0)  # profile 0
         self.assertEqual(buf[3], 2)  # 500Hz -> 2
+        expected_csum = (~sum(buf[1:8])) & 0xFF
+        self.assertEqual(buf[8], expected_csum)
 
     @patch.object(SkillkorpK20Driver, "find_device", return_value="/dev/hidraw_test")
     @patch("os.path.exists", return_value=True)
@@ -153,7 +183,10 @@ class TestDriverMethods(unittest.TestCase):
         args, _ = mock_ioctl.call_args
         buf = args[2]
         self.assertEqual(buf[1], CMD_SET_DEBOUNCE)
+        self.assertEqual(buf[2], 0)  # profile 0
         self.assertEqual(buf[3], 4)
+        expected_csum = (~sum(buf[1:8])) & 0xFF
+        self.assertEqual(buf[8], expected_csum)
 
     @patch.object(SkillkorpK20Driver, "find_device", return_value="/dev/hidraw_test")
     @patch("os.path.exists", return_value=True)
@@ -167,10 +200,13 @@ class TestDriverMethods(unittest.TestCase):
         args, _ = mock_ioctl.call_args
         buf = args[2]
         self.assertEqual(buf[1], CMD_SET_KBOPTION)
+        self.assertEqual(buf[2], 0)  # profile 0
         bitfield = buf[3]
         self.assertTrue(bool(bitfield & (1 << 0)))  # win_lock bit
         self.assertTrue(bool(bitfield & (1 << 6)))  # gaming_mode bit
         self.assertFalse(bool(bitfield & (1 << 3)))  # wasd_swap bit
+        expected_csum = (~sum(buf[1:8])) & 0xFF
+        self.assertEqual(buf[8], expected_csum)
 
     @patch.object(SkillkorpK20Driver, "find_device", return_value="/dev/hidraw_test")
     @patch("os.path.exists", return_value=True)
@@ -178,18 +214,22 @@ class TestDriverMethods(unittest.TestCase):
     @patch("os.close")
     @patch("fcntl.ioctl", return_value=65)
     def test_remap_key(self, mock_ioctl, mock_close, mock_open_fd, mock_exists, mock_find):
-        # Spec: FEA_CMD_SET_KEYMATRIX_SIMPLE places the 4-byte action frame at buf[8..11].
+        # Spec: FEA_CMD_SET_KEYMATRIX_SIMPLE places action frame at buf[9..12] (payload[8..11]),
+        # with BIT7 checksum at buf[8] (payload[7]).
         driver = SkillkorpK20Driver()
         success = driver.remap_key("F1", "media_vol_up")
         self.assertTrue(success)
         args, _ = mock_ioctl.call_args
         buf = args[2]
         self.assertEqual(buf[1], CMD_SET_KEYMATRIX_SIMPLE)
+        self.assertEqual(buf[2], 0)  # profile 0
         self.assertEqual(buf[3], 1)  # F1 index is 1
-        self.assertEqual(buf[8], 3)
-        self.assertEqual(buf[9], 0)
-        self.assertEqual(buf[10], 233)  # 0xE9 volume up
-        self.assertEqual(buf[11], 0)
+        expected_csum = (~sum(buf[1:8])) & 0xFF
+        self.assertEqual(buf[8], expected_csum)
+        self.assertEqual(buf[9], 3)
+        self.assertEqual(buf[10], 0)
+        self.assertEqual(buf[11], 233)  # 0xE9 volume up
+        self.assertEqual(buf[12], 0)
 
     @patch.object(SkillkorpK20Driver, "find_device", return_value="/dev/hidraw_test")
     @patch("os.path.exists", return_value=True)
@@ -203,10 +243,13 @@ class TestDriverMethods(unittest.TestCase):
         args, _ = mock_ioctl.call_args
         buf = args[2]
         self.assertEqual(buf[1], CMD_SET_FN_SIMPLE)
-        self.assertEqual(buf[8], 1)
-        self.assertEqual(buf[9], 0)
-        self.assertEqual(buf[10], 240)
-        self.assertEqual(buf[11], 0)
+        self.assertEqual(buf[2], 0)  # profile 0
+        expected_csum = (~sum(buf[1:8])) & 0xFF
+        self.assertEqual(buf[8], expected_csum)
+        self.assertEqual(buf[9], 1)
+        self.assertEqual(buf[10], 0)
+        self.assertEqual(buf[11], 240)
+        self.assertEqual(buf[12], 0)
 
     @patch.object(SkillkorpK20Driver, "find_device", return_value="/dev/hidraw_test")
     @patch("os.path.exists", return_value=True)
@@ -220,14 +263,16 @@ class TestDriverMethods(unittest.TestCase):
         args, _ = mock_ioctl.call_args
         buf = args[2]
         self.assertEqual(buf[1], CMD_SET_SLEEPTIME)
+        expected_csum = (~sum(buf[1:8])) & 0xFF
+        self.assertEqual(buf[8], expected_csum)
 
         light_lo, light_hi = 300 & 0xFF, (300 >> 8) & 0xFF
         deep_lo, deep_hi = 1680 & 0xFF, (1680 >> 8) & 0xFF
 
-        self.assertEqual((buf[8], buf[9]), (light_lo, light_hi))
-        self.assertEqual((buf[10], buf[11]), (light_lo, light_hi))
-        self.assertEqual((buf[12], buf[13]), (deep_lo, deep_hi))
-        self.assertEqual((buf[14], buf[15]), (deep_lo, deep_hi))
+        self.assertEqual((buf[9], buf[10]), (light_lo, light_hi))
+        self.assertEqual((buf[11], buf[12]), (light_lo, light_hi))
+        self.assertEqual((buf[13], buf[14]), (deep_lo, deep_hi))
+        self.assertEqual((buf[15], buf[16]), (deep_lo, deep_hi))
 
     @patch.object(SkillkorpK20Driver, "find_device", return_value="/dev/hidraw_test")
     @patch("os.path.exists", return_value=True)
@@ -241,6 +286,8 @@ class TestDriverMethods(unittest.TestCase):
         args, _ = mock_ioctl.call_args
         buf = args[2]
         self.assertEqual(buf[1], CMD_SET_RESERT)
+        expected_csum = (~sum(buf[1:8])) & 0xFF
+        self.assertEqual(buf[8], expected_csum)
 
     @patch.object(SkillkorpK20Driver, "is_wireless", return_value=True)
     @patch.object(SkillkorpK20Driver, "is_connected", return_value=True)
@@ -404,5 +451,33 @@ class TestProfileManagerKeyboard(unittest.TestCase):
             self.pm.import_profile(path)
 
 
+class TestChecksumCalculation(unittest.TestCase):
+    """Tests du calcul de checksum BIT7 et BIT8 pour le SoC Yichip YC3121."""
+
+    def test_apply_checksum_bit7(self):
+        payload = bytearray(64)
+        payload[0] = 0x11  # CMD_SET_DEBOUNCE
+        payload[1] = 0
+        payload[2] = 8     # 8ms debounce
+        SkillkorpK20Driver._apply_checksum(payload, "bit7")
+        expected = (~(0x11 + 0x08)) & 0xFF
+        self.assertEqual(payload[7], expected)
+
+    def test_apply_checksum_bit8(self):
+        payload = bytearray(64)
+        payload[0] = 0x07  # CMD_SET_LEDPARAM
+        payload[1] = 1     # static
+        payload[2] = 2     # speed
+        payload[3] = 4     # brightness
+        payload[4] = 8     # normal
+        payload[5] = 255   # R
+        payload[6] = 0     # G
+        payload[7] = 0     # B
+        SkillkorpK20Driver._apply_checksum(payload, "bit8")
+        expected = (~sum(payload[0:8])) & 0xFF
+        self.assertEqual(payload[8], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
+

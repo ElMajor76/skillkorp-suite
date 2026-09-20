@@ -51,18 +51,18 @@ POLLING_RATE_MAP = {
 }
 CODE_TO_POLLING_RATE = {1: 1000, 2: 500, 4: 250, 8: 125}
 
-# RGB Lighting Effects (FEA_CMD_SET_LEDPARAM = 0x04)
+# RGB Lighting Effects (FEA_CMD_SET_LEDPARAM = 0x07)
 LIGHT_MODES = [
     ("off", "Éteint (Off)", 0),
     ("static", "Fixe (Always On)", 1),
     ("breathing", "Respiration (Breathing)", 2),
-    ("wave", "Onde (Wave)", 3),
-    ("ripple", "Ondulation (Ripple)", 4),
-    ("raindrop", "Gouttes de pluie (Raindrop)", 5),
-    ("snake", "Serpent (Snake)", 6),
-    ("press_action", "Touche active (Press Action)", 7),
-    ("convergence", "Convergence", 8),
-    ("custom", "Personnalisé (Custom)", 9),
+    ("wave", "Onde (Wave)", 4),
+    ("ripple", "Ondulation (Ripple)", 5),
+    ("raindrop", "Gouttes de pluie (Raindrop)", 6),
+    ("snake", "Serpent (Snake)", 7),
+    ("press_action", "Touche active (Press Action)", 8),
+    ("convergence", "Convergence", 9),
+    ("custom", "Personnalisé (Custom)", 13),
 ]
 
 LIGHT_MODE_BY_CODE = {code: key for key, _, code in LIGHT_MODES}
@@ -73,26 +73,26 @@ SIDE_LIGHT_MODES = [
     ("off", "Éteint (Off)", 0),
     ("static", "Fixe (Static)", 1),
     ("breathing", "Respiration (Breathing)", 2),
-    ("wave", "Onde (Wave)", 3),
-    ("rainbow", "Arc-en-ciel (Rainbow)", 4),
+    ("wave", "Onde (Wave)", 4),
+    ("rainbow", "Arc-en-ciel (Rainbow)", 3),
 ]
 SIDE_LIGHT_MODE_BY_CODE = {code: key for key, _, code in SIDE_LIGHT_MODES}
 SIDE_LIGHT_CODE_BY_KEY = {key: code for key, _, code in SIDE_LIGHT_MODES}
 
-# Protocol Command Codes
-CMD_SET_REPORT = 0x01      # Polling rate
-CMD_GET_REPORT = 0x81
-CMD_SET_PROFILE = 0x02     # Profile index
-CMD_GET_PROFILE = 0x82
-CMD_SET_LEDPARAM = 0x04    # Backlight LED config
-CMD_GET_LEDPARAM = 0x84
+# Protocol Command Codes (reverse-engineered from iot_driver.exe / Electron client)
+CMD_SET_REPORT = 0x04      # Polling rate
+CMD_GET_REPORT = 0x84
+CMD_SET_PROFILE = 0x05     # Profile index
+CMD_GET_PROFILE = 0x85
+CMD_SET_LEDPARAM = 0x07    # Backlight LED config
+CMD_GET_LEDPARAM = 0x87
 CMD_SET_KBOPTION = 0x06    # Winlock, WASD swap, OS mode, Gaming mode
 CMD_GET_KBOPTION = 0x86
 CMD_SET_SLEDPARAM = 0x08   # Side LED config
 CMD_GET_SLEDPARAM = 0x88
 CMD_SET_KEYMATRIX = 0x09   # Full key matrix
 CMD_GET_KEYMATRIX = 0x89
-CMD_SET_RESERT = 0x0A      # Factory reset
+CMD_SET_RESERT = 0x02      # Factory reset
 CMD_SET_DEBOUNCE = 0x11    # Debounce time in ms
 CMD_GET_DEBOUNCE = 0x91
 CMD_SET_SLEEPTIME = 0x12   # Light & deep sleep times
@@ -348,17 +348,41 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
                 return "4011" in c
         return False
 
-    def _send_feature_report(self, payload: bytes) -> bool:
+    @staticmethod
+    def _apply_checksum(payload: bytearray, checksum_type: str = "bit7") -> bytearray:
+        """Apply one's-complement checksum to a 64-byte payload.
+
+        - 'bit7': payload[7] = (~sum(payload[0:7])) & 0xFF
+                  Used by default for standard commands (options, debounce, rate,
+                  sleep, key remaps, query commands).
+        - 'bit8': payload[8] = (~sum(payload[0:8])) & 0xFF
+                  Used for LED parameter commands (CMD_SET_LEDPARAM, CMD_SET_SLEDPARAM).
+        """
+        if checksum_type == "bit7":
+            csum = sum(payload[0:7]) & 0xFF
+            payload[7] = (~csum) & 0xFF
+        elif checksum_type == "bit8":
+            csum = sum(payload[0:8]) & 0xFF
+            payload[8] = (~csum) & 0xFF
+        return payload
+
+    def _send_feature_report(self, payload: bytes, checksum_type: Optional[str] = "bit7") -> bool:
         """Send a 65-byte HID feature report to the keyboard (byte 0 = 0x00 Report ID)."""
         dev = self.dev_path or self.find_device()
         if not dev or not os.path.exists(dev):
             return False
 
-        # Ensure buffer is exactly 65 bytes
+        # Ensure buffer is exactly 64 bytes for payload
+        p = bytearray(64)
+        for i in range(min(len(payload), 64)):
+            p[i] = payload[i]
+
+        if checksum_type:
+            self._apply_checksum(p, checksum_type)
+
         buf = bytearray(65)
         buf[0] = 0x00
-        for i in range(min(len(payload), 64)):
-            buf[1 + i] = payload[i]
+        buf[1:65] = p
 
         try:
             fd = os.open(dev, os.O_RDWR)
@@ -374,27 +398,34 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
             print(f"Erreur d'envoi de rapport HID: {e}", file=sys.stderr)
             return False
 
-    def _read_feature_report(self, cmd: int, length: int = 65) -> Optional[bytearray]:
+    def _read_feature_report(self, cmd: int, length: int = 65, checksum_type: str = "bit7") -> Optional[bytearray]:
         """Send a feature report query and read back the reply via HIDIOCSFEATURE + HIDIOCGFEATURE.
 
-        1. Populates buf[0] = 0x00 (Report ID), buf[1] = cmd, and sends via _HIDIOCSFEATURE(length).
-        2. Reads the response into the same buffer via _HIDIOCGFEATURE(length).
+        1. Populates buf[0] = 0x00 (Report ID), buf[1] = cmd, calculates checksum, and sends via _HIDIOCSFEATURE(length).
+        2. Reads the response into read_buf via _HIDIOCGFEATURE(length).
         """
         dev = self.dev_path or self.find_device()
         if not dev or not os.path.exists(dev):
             return None
 
+        query_payload = bytearray(64)
+        query_payload[0] = cmd
+        if checksum_type:
+            self._apply_checksum(query_payload, checksum_type)
+
         buf = bytearray(length)
         buf[0] = 0x00
-        buf[1] = cmd
+        buf[1:min(length, 65)] = query_payload[:min(length - 1, 64)]
 
         try:
             fd = os.open(dev, os.O_RDWR)
             try:
                 fcntl.ioctl(fd, _HIDIOCSFEATURE(length), buf)
-                time.sleep(0.01)
-                fcntl.ioctl(fd, _HIDIOCGFEATURE(length), buf)
-                return buf
+                time.sleep(0.02)
+                read_buf = bytearray(length)
+                read_buf[0] = 0x00
+                fcntl.ioctl(fd, _HIDIOCGFEATURE(length), read_buf)
+                return read_buf
             finally:
                 os.close(fd)
         except PermissionError:
@@ -497,7 +528,7 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         - direction: 0 (standard/right) or 1 (left)
         - color: hex string (e.g. '#FF0000')
         """
-        code = LIGHT_CODE_BY_KEY.get(mode.lower(), 3)  # default Wave
+        code = LIGHT_CODE_BY_KEY.get(mode.lower(), 4)  # default Wave (code 4)
         speed = max(1, min(5, speed))
         brightness = max(0, min(4, brightness))
         direction = 1 if direction else 0
@@ -520,12 +551,16 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         payload[1] = code
         payload[2] = hw_speed
         payload[3] = brightness
-        payload[4] = direction
+        dazzle_flag = 8 if color else 7
+        if code == 4:  # Wave
+            payload[4] = (direction << 4) | dazzle_flag
+        else:
+            payload[4] = dazzle_flag
         payload[5] = r
         payload[6] = g
         payload[7] = b
 
-        success = self._send_feature_report(payload)
+        success = self._send_feature_report(payload, checksum_type="bit8")
         if success:
             self.config["rgb"]["mode"] = mode
             self.config["rgb"]["speed"] = speed
@@ -550,7 +585,7 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         - brightness: 0 to 4
         - color: hex string (e.g. '#00FFCC')
         """
-        code = SIDE_LIGHT_CODE_BY_KEY.get(mode.lower(), 4)
+        code = SIDE_LIGHT_CODE_BY_KEY.get(mode.lower(), 3)  # default rainbow (code 3)
         speed = max(1, min(5, speed))
         brightness = max(0, min(4, brightness))
 
@@ -570,12 +605,12 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         payload[1] = code
         payload[2] = speed
         payload[3] = brightness
-        payload[4] = 0
+        payload[4] = 8 if color else 7
         payload[5] = r
         payload[6] = g
         payload[7] = b
 
-        success = self._send_feature_report(payload)
+        success = self._send_feature_report(payload, checksum_type="bit8")
         if success:
             self.config["side_rgb"]["mode"] = mode
             self.config["side_rgb"]["speed"] = speed
@@ -596,7 +631,7 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         payload[1] = self.config.get("profile_index", 0)
         payload[2] = code
 
-        success = self._send_feature_report(payload)
+        success = self._send_feature_report(payload, checksum_type="bit7")
         if success:
             self.config["polling_rate"] = rate_hz
             self.save_config()
@@ -613,20 +648,21 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
 
         payload = bytearray(64)
         payload[0] = CMD_SET_SLEEPTIME
-        # BT light sleep (buf[8..9])
-        payload[7] = light_sleep_sec & 0xFF
-        payload[8] = (light_sleep_sec >> 8) & 0xFF
-        # 2.4G light sleep (buf[10..11])
-        payload[9] = light_sleep_sec & 0xFF
-        payload[10] = (light_sleep_sec >> 8) & 0xFF
-        # BT deep sleep (buf[12..13])
-        payload[11] = deep_sleep_sec & 0xFF
-        payload[12] = (deep_sleep_sec >> 8) & 0xFF
-        # 2.4G deep sleep (buf[14..15])
-        payload[13] = deep_sleep_sec & 0xFF
-        payload[14] = (deep_sleep_sec >> 8) & 0xFF
+        # Checksum is placed at payload[7] (buf[8])
+        # BT light sleep (payload[8..9] / buf[9..10])
+        payload[8] = light_sleep_sec & 0xFF
+        payload[9] = (light_sleep_sec >> 8) & 0xFF
+        # 2.4G light sleep (payload[10..11] / buf[11..12])
+        payload[10] = light_sleep_sec & 0xFF
+        payload[11] = (light_sleep_sec >> 8) & 0xFF
+        # BT deep sleep (payload[12..13] / buf[13..14])
+        payload[12] = deep_sleep_sec & 0xFF
+        payload[13] = (deep_sleep_sec >> 8) & 0xFF
+        # 2.4G deep sleep (payload[14..15] / buf[15..16])
+        payload[14] = deep_sleep_sec & 0xFF
+        payload[15] = (deep_sleep_sec >> 8) & 0xFF
 
-        success = self._send_feature_report(payload)
+        success = self._send_feature_report(payload, checksum_type="bit7")
         if success:
             self.config["sleep"]["light_sleep_sec"] = light_sleep_sec
             self.config["sleep"]["deep_sleep_sec"] = deep_sleep_sec
@@ -642,7 +678,7 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         payload[1] = self.config.get("profile_index", 0)
         payload[2] = debounce_ms
 
-        success = self._send_feature_report(payload)
+        success = self._send_feature_report(payload, checksum_type="bit7")
         if success:
             self.config["debounce_ms"] = debounce_ms
             self.save_config()
@@ -691,7 +727,7 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         payload[1] = self.config.get("profile_index", 0)
         payload[2] = bitfield
 
-        success = self._send_feature_report(payload)
+        success = self._send_feature_report(payload, checksum_type="bit7")
         if success:
             self.config["options"]["win_lock"] = cur_win_lock
             self.config["options"]["wasd_swap"] = cur_wasd_swap
@@ -708,7 +744,7 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         payload[0] = CMD_SET_PROFILE
         payload[1] = profile_idx
 
-        success = self._send_feature_report(payload)
+        success = self._send_feature_report(payload, checksum_type="bit7")
         if success:
             self.config["profile_index"] = profile_idx
             self.save_config()
@@ -736,13 +772,14 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         payload[0] = CMD_SET_KEYMATRIX_SIMPLE
         payload[1] = profile_idx
         payload[2] = key_idx
-        # Action frame at buf[8..11]
-        payload[7] = action_bytes[0]
-        payload[8] = action_bytes[1]
-        payload[9] = action_bytes[2]
-        payload[10] = action_bytes[3]
+        # Checksum is computed into payload[7] (buf[8])
+        # Action frame at payload[8..11] (buf[9..12])
+        payload[8] = action_bytes[0]
+        payload[9] = action_bytes[1]
+        payload[10] = action_bytes[2]
+        payload[11] = action_bytes[3]
 
-        success = self._send_feature_report(payload)
+        success = self._send_feature_report(payload, checksum_type="bit7")
         if success:
             self.config.setdefault("key_remaps", {})[key_name] = action_key
             self.save_config()
@@ -769,13 +806,14 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         payload[0] = CMD_SET_FN_SIMPLE
         payload[1] = profile_idx
         payload[2] = key_idx
-        # Action frame at buf[8..11]
-        payload[7] = action_bytes[0]
-        payload[8] = action_bytes[1]
-        payload[9] = action_bytes[2]
-        payload[10] = action_bytes[3]
+        # Checksum is computed into payload[7] (buf[8])
+        # Action frame at payload[8..11] (buf[9..12])
+        payload[8] = action_bytes[0]
+        payload[9] = action_bytes[1]
+        payload[10] = action_bytes[2]
+        payload[11] = action_bytes[3]
 
-        success = self._send_feature_report(payload)
+        success = self._send_feature_report(payload, checksum_type="bit7")
         if success:
             self.config.setdefault("fn_remaps", {})[key_name] = action_key
             self.save_config()
@@ -785,7 +823,7 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         """Restore keyboard to factory default settings."""
         payload = bytearray(64)
         payload[0] = CMD_SET_RESERT
-        success = self._send_feature_report(payload)
+        success = self._send_feature_report(payload, checksum_type="bit7")
         if success:
             self.config = self._default_config()
             self.save_config()
