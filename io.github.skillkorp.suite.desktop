@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=SkillKorp Suite
+GenericName=Gestionnaire de Périphériques Gaming
+Comment=Pilote et configuration unifiés du clavier K20 Ultimate et de la souris M20 Ultimate SkillKorp
+Exec=skillkorp-gui
+Icon=skillkorp-suite
+Terminal=false
+Type=Application
+Categories=Settings;HardwareSettings;Utility;
+Keywords=keyboard;clavier;mouse;souris;skillkorp;k20;m20;rgb;dpi;gaming;
+StartupNotify=true

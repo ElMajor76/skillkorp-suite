@@ -1,0 +1,15 @@
+# udev rules for SkillKorp Suite (K20 Ultimate keyboard + M20 Ultimate mouse)
+# TAG+="uaccess" grants access to the currently logged-in session user (logind).
+# MODE="0660" restricts access to root+plugdev for other sessions.
+
+# --- SkillKorp K20 Ultimate keyboard ---
+# Wireless nano receiver 2.4GHz (3151:4011)
+KERNEL=="hidraw*", ATTRS{idVendor}=="3151", ATTRS{idProduct}=="4011", MODE="0660", TAG+="uaccess"
+# USB Wired connection (3151:4015)
+KERNEL=="hidraw*", ATTRS{idVendor}=="3151", ATTRS{idProduct}=="4015", MODE="0660", TAG+="uaccess"
+
+# --- SkillKorp M20 Ultimate mouse ---
+# Wireless nano receiver (1d57:fa60)
+KERNEL=="hidraw*", ATTRS{idVendor}=="1d57", ATTRS{idProduct}=="fa60", MODE="0660", TAG+="uaccess"
+# USB-C Wired connection (1d57:fa61)
+KERNEL=="hidraw*", ATTRS{idVendor}=="1d57", ATTRS{idProduct}=="fa61", MODE="0660", TAG+="uaccess"

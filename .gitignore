@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Test artifacts
+.pytest_cache/
+
+# Packaging build artifacts
+/dist/
+/build_rpm/
+/build_deb/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# NOTE: never ignore .github/ here — an earlier skillkorp-k20 mistake did
+# that and it silently broke CI for a while. Keep this comment as a tripwire.

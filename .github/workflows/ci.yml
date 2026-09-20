@@ -1,0 +1,109 @@
+name: CI — Lint & Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    name: Lint (flake8) + Tests (pytest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Configurer Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances de test
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest flake8
+
+      - name: Lint — flake8 (erreurs critiques uniquement)
+        run: |
+          # E9xx = erreurs de syntaxe/runtime, F63x/F7xx/F82x = bugs logiques
+          flake8 skillkorp bin/skillkorpctl \
+            --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Style — flake8 (avertissements, non bloquant)
+        run: |
+          flake8 skillkorp bin/skillkorpctl \
+            --count --exit-zero --max-line-length=120 --statistics
+        continue-on-error: true
+
+      - name: Tests unitaires — pytest
+        run: |
+          python -m pytest tests/ -v --tb=short
+
+  smoke-test:
+    name: Smoke test — import des pilotes (sans GTK)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Configurer Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Vérifier que skillkorp.devices.keyboard s'importe sans erreur
+        run: |
+          python -c "
+          from skillkorp.devices.keyboard import (
+              POLLING_RATE_MAP, LIGHT_MODES, SIDE_LIGHT_MODES, KEY_LAYOUT,
+              REMAP_ACTIONS, SkillkorpK20Driver, _HIDIOCSFEATURE, _HIDIOCGFEATURE
+          )
+          print(f'✓ skillkorp.devices.keyboard importé : {len(KEY_LAYOUT)} touches dans la matrice')
+          print(f'✓ {len(LIGHT_MODES)} modes RGB et {len(SIDE_LIGHT_MODES)} modes latéraux')
+          assert len(KEY_LAYOUT) == 85, 'Touches manquantes dans KEY_LAYOUT'
+          assert SkillkorpK20Driver.device_type == 'keyboard'
+          print('✓ Toutes les 85 touches sont présentes')
+          "
+
+      - name: Vérifier que skillkorp.devices.mouse s'importe sans erreur
+        run: |
+          python -c "
+          from skillkorp.devices.mouse import (
+              POLLING_RATE_MAP, LIGHT_MODES, BUTTON_ACTIONS,
+              PHYSICAL_BTN_TO_SLOT, SkillkorpM20Driver, _HIDIOCSFEATURE
+          )
+          print(f'✓ skillkorp.devices.mouse importé : {len(BUTTON_ACTIONS)} actions boutons')
+          print(f'✓ PHYSICAL_BTN_TO_SLOT : boutons {sorted(PHYSICAL_BTN_TO_SLOT.keys())}')
+          assert set(PHYSICAL_BTN_TO_SLOT.keys()) == {1,2,3,4,5,6}, 'Bouton 6 manquant!'
+          assert SkillkorpM20Driver.device_type == 'mouse'
+          print('✓ Tous les boutons 1-6 présents')
+          "
+
+      - name: Vérifier que skillkorp.profiles.manager s'importe sans erreur
+        run: |
+          python -c "
+          from skillkorp.profiles.manager import (
+              DEFAULT_PROFILES_KEYBOARD, DEFAULT_PROFILES_MOUSE,
+              is_autostart_enabled, set_autostart, ProfileManager,
+          )
+          print(f'✓ profile manager importé : {len(DEFAULT_PROFILES_KEYBOARD)} profils clavier, {len(DEFAULT_PROFILES_MOUSE)} profils souris')
+          required_kb = {'rgb', 'side_rgb', 'polling_rate', 'debounce_ms', 'sleep', 'options', 'key_remaps'}
+          for pid, p in DEFAULT_PROFILES_KEYBOARD.items():
+              missing = required_kb - set(p.keys())
+              assert not missing, f'Profil clavier {pid} manque: {missing}'
+          required_mouse = {'light_mode', 'brightness', 'speed', 'light_color'}
+          for pid, p in DEFAULT_PROFILES_MOUSE.items():
+              missing = required_mouse - set(p.keys())
+              assert not missing, f'Profil souris {pid} manque: {missing}'
+          print('✓ Tous les profils ont les champs requis')
+          "
+
+      - name: Vérifier que skillkorp.profiles.migration s'importe sans erreur
+        run: |
+          python -c "
+          from skillkorp.profiles.migration import migrate_legacy_configs
+          print('✓ skillkorp.profiles.migration importé')
+          "

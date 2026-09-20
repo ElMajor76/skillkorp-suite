@@ -1,0 +1,42 @@
+# Maintainer: nplacide <nplacide95@gmail.com>
+pkgname=skillkorp-suite
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Unified Linux driver, CLI, and GTK4/Libadwaita GUI for SkillKorp K20 Ultimate keyboard & M20 Ultimate mouse"
+arch=('any')
+url="https://github.com/ElMajor76/skillkorp-suite"
+license=('MIT')
+depends=('python' 'python-gobject' 'libadwaita' 'systemd')
+optdepends=(
+    'libayatana-appindicator: Support for system tray icon'
+    'libappindicator-gtk3: Alternative tray icon support'
+    'xdotool: Auto-switching profiles based on active window under X11'
+)
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+
+    install -d "$pkgdir/usr/share/$pkgname"
+    install -d "$pkgdir/usr/bin"
+    install -d "$pkgdir/usr/lib/udev/rules.d"
+    install -d "$pkgdir/usr/share/applications"
+    install -d "$pkgdir/usr/share/icons/hicolor/256x256/apps"
+    install -d "$pkgdir/usr/share/licenses/$pkgname"
+
+    cp -r skillkorp "$pkgdir/usr/share/$pkgname/skillkorp"
+    find "$pkgdir/usr/share/$pkgname/skillkorp" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+    install -m 0755 bin/skillkorpctl "$pkgdir/usr/share/$pkgname/skillkorpctl"
+    cp -r assets "$pkgdir/usr/share/$pkgname/"
+
+    ln -s "/usr/share/$pkgname/skillkorpctl" "$pkgdir/usr/bin/skillkorpctl"
+    printf '#!/bin/sh\nexec env PYTHONPATH="/usr/share/%s:$PYTHONPATH" python3 -m skillkorp.gui "$@"\n' "$pkgname" > "$pkgdir/usr/bin/skillkorp-gui"
+    printf '#!/bin/sh\nexec env PYTHONPATH="/usr/share/%s:$PYTHONPATH" python3 -m skillkorp.tray "$@"\n' "$pkgname" > "$pkgdir/usr/bin/skillkorp-tray"
+    chmod 0755 "$pkgdir/usr/bin/skillkorp-gui" "$pkgdir/usr/bin/skillkorp-tray"
+
+    install -m 0644 udev/99-skillkorp-suite.rules "$pkgdir/usr/lib/udev/rules.d/99-skillkorp-suite.rules"
+    install -m 0644 io.github.skillkorp.suite.desktop "$pkgdir/usr/share/applications/io.github.skillkorp.suite.desktop"
+    install -m 0644 assets/skillkorp-suite.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/skillkorp-suite.png"
+    install -m 0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

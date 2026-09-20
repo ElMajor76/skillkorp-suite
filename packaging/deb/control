@@ -1,0 +1,16 @@
+Package: skillkorp-suite
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3, python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, udev, gir1.2-notify-0.7
+Recommends: gir1.2-ayatanaappindicator3-0.1 | gir1.2-appindicator3-0.1
+Maintainer: nplacide <nplacide95@gmail.com>
+Homepage: https://github.com/ElMajor76/skillkorp-suite
+Description: Unified Linux driver, CLI, and GUI for SkillKorp K20 keyboard & M20 mouse
+ Native Linux implementation of hardware drivers, a unified CLI tool
+ (skillkorpctl), and a modern GTK 4 / Libadwaita GUI for both the
+ SkillKorp K20 Ultimate compact 75% mechanical wireless keyboard
+ (Yichip YC3121 SoC / CX71D board) and the SkillKorp M20 Ultimate
+ wireless gaming mouse (PixArt PAW3395 sensor & Beken BK3633 MCU).
+ Replaces the separate skillkorp-k20 and skillkorp-m20 packages.

@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""skillkorpctl - entry point. See skillkorp/cli.py for the implementation."""
+import os
+import sys
+
+# Locate the directory containing the "skillkorp" package, whether this
+# script runs from a source checkout (<repo>/bin/skillkorpctl, package at
+# <repo>/skillkorp) or from a package install where it is flattened next
+# to the package (e.g. /usr/share/skillkorp-suite/skillkorpctl).
+_HERE = os.path.dirname(os.path.realpath(__file__))
+for _candidate in (_HERE, os.path.dirname(_HERE)):
+    if os.path.isdir(os.path.join(_candidate, "skillkorp")):
+        if _candidate not in sys.path:
+            sys.path.insert(0, _candidate)
+        break
+
+from skillkorp.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())
