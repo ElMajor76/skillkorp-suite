@@ -3,6 +3,44 @@
 Toutes les modifications notables sont documentées dans ce fichier.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 
+## [1.2.0] — 2026-10-11
+
+Validée sur le matériel (K20 en 2.4 GHz et en filaire, M20 par récepteur).
+
+### Sécurité
+- La règle udev n'ouvre plus que l'**interface de configuration** (interface
+  USB 2) de chaque appareil : les interfaces qui transportent les frappes du
+  clavier et les mouvements de la souris ne sont plus lisibles par les
+  programmes de la session. Les droits accordés par l'ancienne règle sont
+  retirés à l'installation ; `skillkorpctl doctor` signale toute interface de
+  saisie encore exposée.
+
+### Corrigé — clavier K20
+- **Le clavier ne réagissait à aucune commande via son récepteur 2.4 GHz.**
+  Protocole du récepteur reproduit d'après une capture USB du logiciel
+  officiel (initialisation `FE 40`/`F6 0A`, état `F7`, récupération des
+  réponses par `FC`) : réglages et lectures fonctionnent sans fil, une
+  réponse restée en attente (qui bloquait le récepteur) est récupérée avant
+  chaque envoi. Batterie lue sur le récepteur.
+
+### Ajouté
+- Réglages du clavier envoyés pendant sa veille : enregistrés puis appliqués
+  automatiquement à son réveil (indicateur, application, ou
+  `skillkorpctl keyboard sync`), au lieu d'échouer.
+- Indicateur : seul le logo s'affiche dans la barre, les batteries sont dans
+  son menu avec les icônes clavier et souris du thème système ; il démarre
+  avec la session (`/etc/xdg/autostart`, désactivable par utilisateur) et
+  avec l'application ; son bouton « Quitter » ferme aussi l'application.
+- Application : icônes du thème système (appareils, niveau de batterie) à la
+  place des émojis.
+- Commande `skillkorpctl mouse battery`, pendant de `keyboard battery`.
+- Souris : chaque écriture est vérifiée par l'accusé du récepteur
+  (`03 10 50 00`) et renvoyée une fois si besoin ; réglages d'éclairage,
+  absents de la M20 Ultimate, retirés de l'interface.
+- Outils : `tools/usbcapture.py` (capture usbmon des échanges de
+  configuration, sans enregistrer les frappes) et `tools/hwtest.py` (test
+  matériel guidé, chaque réglage restauré après son test).
+
 ## [1.1.0] — 2026-10-11
 
 Audit complet et fiabilisation ; détail et preuves dans [AUDIT.md](AUDIT.md).
@@ -10,12 +48,6 @@ Les corrections de protocole ont été vérifiées contre les logiciels officiel
 (KU_SkillKorp Driver 2.1.78 et MU_SkillKorp.exe).
 
 ### Corrigé — clavier K20
-- **Le clavier ne réagissait à aucune commande via son récepteur 2.4 GHz.**
-  Protocole du récepteur reproduit d'après une capture USB du logiciel
-  officiel (initialisation `FE 40`/`F6 0A`, état `F7`, récupération des
-  réponses par `FC`) : réglages et lectures fonctionnent sans fil, un
-  récepteur bloqué est débloqué automatiquement, un clavier en veille est
-  signalé. Batterie lue sur le récepteur.
 - Flag multicolore (« dazzle ») inversé : une couleur choisie donnait un effet
   arc-en-ciel, et la GUI renvoyait du rouge à chaque réglage.
 - Remappage envoyé sur la mauvaise touche (index de la disposition au lieu de
@@ -33,9 +65,6 @@ Les corrections de protocole ont été vérifiées contre les logiciels officiel
   « extinction des LED » ; option « réveil au mouvement » retirée (absente
   sur la M20).
 - Rapports dimensionnés selon le descripteur HID ; lecture batterie fiable.
-- Chaque écriture est vérifiée par l'accusé du récepteur (`03 10 50 00`) et
-  renvoyée une fois si besoin ; les réglages d'éclairage, absents de la M20
-  Ultimate, sont retirés de la GUI.
 
 ### Corrigé — logiciel
 - GUI et tray ne se figent plus (E/S en arrière-plan), erreurs affichées,
@@ -45,15 +74,6 @@ Les corrections de protocole ont été vérifiées contre les logiciels officiel
 - Configuration écrite de façon atomique et verrouillée entre processus ;
   fichiers corrompus mis de côté au lieu d'être écrasés.
 - Raccourcis Ctrl+Z / Ctrl+A corrigés pour l'AZERTY (envoyaient Ctrl+W / Ctrl+Q).
-- Indicateur : seul le logo s'affiche dans la barre, les batteries sont dans
-  son menu, avec les icônes clavier et souris du thème système (également
-  utilisées dans l'application à la place des émojis) ; il démarre avec la session (`/etc/xdg/autostart`, désactivable
-  par utilisateur) et avec l'application, et son bouton « Quitter » ferme
-  aussi l'application.
-- Commande `skillkorpctl mouse battery` (interroge la souris), pendant de
-  `skillkorpctl keyboard battery`.
-- Outil `tools/usbcapture.py` (capture usbmon des échanges de configuration,
-  sans enregistrer les frappes).
 - Règle udev renommée `70-skillkorp-suite.rules` (le tag `uaccess` était posé
   trop tard) ; lanceurs en mode Python isolé.
 

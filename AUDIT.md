@@ -1,7 +1,8 @@
-# Audit de SkillKorp Suite 1.0.1 → 1.1.0
+# Audit de SkillKorp Suite 1.0.1 → 1.2.0
 
 Audit complet du dépôt (pilotes, CLI, GUI, tray, profils, installation,
-paquets) réalisé le 11/10/2026, suivi des corrections livrées en 1.1.0.
+paquets) réalisé le 11/10/2026, suivi des corrections livrées en 1.1.0 et
+1.2.0 (validation sur le matériel, récepteur 2.4 GHz du clavier, accès udev).
 
 Les points de protocole ont été vérifiés contre les logiciels officiels fournis
 (`ClavierK20Ultimate.exe` et `SourisM20Ultimate.exe`) par analyse statique
@@ -132,6 +133,16 @@ DPI/50−1 sur deux tableaux, étape active, couleurs, checksum 16 bits octets
 * Règle udev nommée `99-…` : le tag `uaccess` doit être posé **avant**
   `73-seat-late.rules`, sinon l'accès sans root n'est pas accordé de façon
   fiable. Renommée `70-skillkorp-suite.rules` (l'ancienne est supprimée).
+* **Sécurité (1.2.0)** : la règle donnait l'accès à *toutes* les interfaces
+  HID des appareils, dont l'interface clavier (frappes) et la souris :
+  n'importe quel programme de la session pouvait lire ce qui était tapé sur
+  le K20 (vérifié pendant la capture USB). Le pilote n'utilise que
+  l'interface 2 (configuration) ; la règle ne cible plus qu'elle, via le
+  `modalias` de l'interface USB parente (`usb:v3151p4011*in02`…). Les ACL
+  déjà posées sur les autres interfaces sont retirées par les scripts
+  d'installation, et `skillkorpctl doctor` signale une interface de saisie
+  encore exposée. Interface 2 vérifiée sur les deux récepteurs ; à confirmer
+  sur les câbles avec `tools/hwtest.py`.
 * Lanceurs `PYTHONPATH="/usr/share/…:$PYTHONPATH"` : avec un `PYTHONPATH` vide,
   le `:` final ajoutait le répertoire courant au chemin d'import. Les lanceurs
   utilisent maintenant `python3 -I` (mode isolé).
