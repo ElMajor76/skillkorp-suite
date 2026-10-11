@@ -338,10 +338,13 @@ def text_row(title: str, subtitle: str = "") -> Adw.ActionRow:
 def battery_icon_name(bat: Optional[Dict[str, Any]]) -> str:
     """Themed battery icon for a battery dict (battery-level-N0[-charging])."""
     pct = (bat or {}).get("percentage")
+    charging = bool((bat or {}).get("charging"))
     if pct is None:
-        return "battery-missing-symbolic"
+        return "battery-good-charging-symbolic" if charging else "battery-missing-symbolic"
     level = max(0, min(100, int(round(pct / 10.0)) * 10))
-    return f"battery-level-{level}{'-charging' if bat.get('charging') else ''}-symbolic"
+    if charging and level == 100:
+        return "battery-level-100-charged-symbolic"
+    return f"battery-level-{level}{'-charging' if charging else ''}-symbolic"
 
 
 class StatusPill(Gtk.Box):
@@ -353,9 +356,17 @@ class StatusPill(Gtk.Box):
         self.append(Gtk.Image.new_from_icon_name(icon_name))
         self._label = Gtk.Label(label="…")
         self.append(self._label)
+        self._battery = Gtk.Image(visible=False)
+        self.append(self._battery)
 
     def set_label(self, text: str):
         self._label.set_label(text)
+
+    def set_battery_icon(self, icon_name: Optional[str]):
+        """Themed battery icon after the text (level, charging); None hides it."""
+        self._battery.set_visible(icon_name is not None)
+        if icon_name:
+            self._battery.set_from_icon_name(icon_name)
 
     def get_label(self) -> str:
         return self._label.get_label()
@@ -704,11 +715,14 @@ class SkillkorpSuiteWindow(Adw.ApplicationWindow):
             pill.remove_css_class(cls)
         if not state.get("connected"):
             pill.set_label("Déconnecté")
+            pill.set_battery_icon(None)
             pill.add_css_class("pill-off")
             return
-        pct = (state.get("battery") or {}).get("percentage")
+        bat = state.get("battery") or {}
+        pct = bat.get("percentage")
         mode = "2.4 GHz" if state.get("wireless") else "USB"
         pill.set_label(mode + (f" · {pct}%" if pct is not None else ""))
+        pill.set_battery_icon(battery_icon_name(bat) if (pct is not None or bat.get("charging")) else None)
         pill.add_css_class("pill-ok" if state.get("access") else "pill-off")
 
     def _update_banner(self):

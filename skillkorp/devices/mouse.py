@@ -309,7 +309,10 @@ def parse_status_report(rep: bytes) -> Optional[Dict[str, Any]]:
         pct = rep[4]
         if pct > 100:
             return None
-        return {"type": "battery", "percentage": pct, "charging": rep[3] == 2}
+        # rep[3] is the power state: 1 on battery, 3 on the USB-C cable
+        # (bit 1 = external power; observed on the real M20: 03 10 40 01 5b
+        # wireless at 91 %, 03 10 40 03 64 wired at 100 %).
+        return {"type": "battery", "percentage": pct, "charging": bool(rep[3] & 0x02)}
     if kind in (0x10, 0x20):
         return {"type": "dpi_stage", "stage": rep[3]}
     if kind == 0x50:
@@ -481,8 +484,12 @@ class SkillkorpM20Driver(SkillkorpDeviceDriver):
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
-    def poll_status(self, timeout: float = 0.3) -> List[Dict[str, Any]]:
-        """Send the 0x0C query and collect status notifications on the same fd."""
+    def poll_status(self, timeout: float = 2.5) -> List[Dict[str, Any]]:
+        """Send the 0x0C query and collect status notifications on the same fd.
+
+        The acknowledgement comes at once but the battery report follows up
+        to ~1.8 s later (measured over the USB-C cable); reading stops as
+        soon as it arrives."""
         events: List[Dict[str, Any]] = []
         with self.open_device() as dev:
             dev.drain_input()
@@ -570,13 +577,19 @@ class SkillkorpM20Driver(SkillkorpDeviceDriver):
                 pass
         self.reload_config_if_changed()
         pct = self.config.get("battery")
-        charging = bool(self.config.get("charging", False))
+        wireless = self.is_wireless()
+        # On the cable the mouse is powered (and charged) by USB, whatever the
+        # last report said; on the receiver trust the reported power state.
+        charging = not wireless or bool(self.config.get("charging", False))
         if pct is None:
-            status = "Niveau inconnu (en attente d'un rapport de la souris)"
+            status = "En charge (câble USB-C)" if charging else \
+                "Niveau inconnu (en attente d'un rapport de la souris)"
+        elif charging:
+            status = f"Chargée ({pct}%)" if pct >= 100 else f"En charge ({pct}%)"
         else:
-            status = f"En charge ({pct}%)" if charging else f"{pct}%"
+            status = f"{pct}%"
         return {"percentage": pct, "charging": charging, "connected": True,
-                "wireless": self.is_wireless(), "status_str": status}
+                "wireless": wireless, "status_str": status}
 
     # ------------------------------------------------------------------
     # Settings

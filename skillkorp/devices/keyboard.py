@@ -1078,15 +1078,29 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
         return data[1] | (data[2] << 8)
 
     def get_battery(self) -> Dict[str, Any]:
-        """Battery status, only known over the 2.4GHz receiver (byte 1 of its
-        0xF7 status); over the cable the keyboard is charging."""
+        """Battery status: level from the 2.4GHz receiver (byte 1 of its 0xF7
+        status); over the cable the keyboard is charging."""
         if not self.is_connected():
             return {"percentage": None, "charging": False, "connected": False,
                     "wireless": False, "status_str": "Non connecté"}
         wireless = self.is_wireless()
         if not wireless:
-            return {"percentage": None, "charging": True, "connected": True,
-                    "wireless": False, "status_str": "Câblé USB (en charge)"}
+            # Over the cable the keyboard charges; 0x83 answers [0x83, level,
+            # state] but the level reads 0 on the K20 (observed: 83 00 01),
+            # so a percentage is only shown when the firmware gives one.
+            pct = None
+            try:
+                data = self._query(CMD_GET_BATTERY)
+                if len(data) >= 2 and data[0] == CMD_GET_BATTERY and 1 <= data[1] <= 100:
+                    pct = data[1]
+            except DeviceError:
+                pass
+            if pct is None:
+                status = "En charge (câble USB)"
+            else:
+                status = f"Chargé ({pct}%)" if pct >= 100 else f"En charge ({pct}%)"
+            return {"percentage": pct, "charging": True, "connected": True,
+                    "wireless": False, "status_str": status}
         try:
             self._wait_command_gap(getattr(self, "_pending_gap", 0.0))
             with self.open_device() as dev:

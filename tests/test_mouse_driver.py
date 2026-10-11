@@ -93,8 +93,31 @@ class TestFrames(unittest.TestCase):
         self.assertEqual(parse_status_report(bytes([3, 0x10, 0x40, 2, 87])),
                          {"type": "battery", "percentage": 87, "charging": True})
         self.assertEqual(parse_status_report(bytes([3, 0, 0x10, 3, 0])), {"type": "dpi_stage", "stage": 3})
+        # Reports captured on the real M20: on battery (state 1), on USB-C (3).
+        self.assertEqual(parse_status_report(bytes.fromhex("031040015b")),
+                         {"type": "battery", "percentage": 91, "charging": False})
+        self.assertEqual(parse_status_report(bytes.fromhex("0310400364")),
+                         {"type": "battery", "percentage": 100, "charging": True})
         self.assertIsNone(parse_status_report(bytes([3, 0, 0x40, 0, 250])))
         self.assertIsNone(parse_status_report(bytes([2, 0, 0x40, 0, 50])))
+
+
+class TestWiredMouse(MouseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.hw.node = make_node(ms.VENDOR_ID, ms.PID_WIRED, M20_VENDOR_DESCRIPTOR)
+
+    def test_cable_means_charging_even_without_report(self):
+        bat = self.drv.get_battery()
+        self.assertTrue(bat["charging"])
+        self.assertIsNone(bat["percentage"])
+        self.assertIn("En charge", bat["status_str"])
+
+    def test_full_on_cable(self):
+        self.hw.input_queue.append(bytes.fromhex("0310400364"))
+        bat = self.drv.get_battery(poll_hardware=True)
+        self.assertEqual((bat["percentage"], bat["charging"]), (100, True))
+        self.assertEqual(bat["status_str"], "Chargée (100%)")
 
 
 class TestDriver(MouseTestCase):
