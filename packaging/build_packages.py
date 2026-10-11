@@ -195,6 +195,10 @@ def build_source_tarball() -> str:
     def flt(ti):
         if "__pycache__" in ti.name or ti.name.endswith((".pyc", ".pyo")):
             return None
+        # The PKGBUILD carries the checksum of this archive: keeping it out
+        # avoids a loop where every build changes both.
+        if ti.name == f"{prefix}/packaging/arch/PKGBUILD":
+            return None
         return _normalize(ti)
 
     raw = io.BytesIO()
