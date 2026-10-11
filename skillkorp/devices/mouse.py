@@ -414,13 +414,17 @@ class SkillkorpM20Driver(SkillkorpDeviceDriver):
     # Transport
     # ------------------------------------------------------------------
     ACK_TIMEOUT = 0.6
+    SEND_ATTEMPTS = 4
 
     def _send(self, *frames: bytes, settle: float = 0.05):
         """Send reports and wait for the receiver's acknowledgement of each one.
 
-        Without an acknowledgement the report is sent once more (the mouse may
-        just have woken up); a second silence raises DeviceIOError on the
-        2.4GHz receiver. Status notifications seen meanwhile are recorded.
+        Without an acknowledgement the report is sent again, up to
+        SEND_ATTEMPTS times: an idle mouse (not moved for a while) keeps its
+        radio in power saving and misses frames now and then (measured: lost
+        at random, several in a row). Resending is harmless, every report
+        carries the complete state. Persistent silence raises DeviceError on
+        the 2.4GHz receiver. Status notifications seen meanwhile are recorded.
         """
         events: List[Dict[str, Any]] = []
         try:
@@ -430,7 +434,7 @@ class SkillkorpM20Driver(SkillkorpDeviceDriver):
                         time.sleep(settle)
                     report_id = frame[0]
                     acked = False
-                    for _attempt in range(2):
+                    for _attempt in range(self.SEND_ATTEMPTS):
                         dev.drain_input()
                         dev.set_feature(frame)
                         for rep in dev.read_input(self.ACK_TIMEOUT, until=lambda r, rid=report_id: (

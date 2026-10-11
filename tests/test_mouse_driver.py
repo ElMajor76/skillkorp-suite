@@ -155,9 +155,23 @@ class TestDriver(MouseTestCase):
     def test_missing_ack_is_retried_then_fails(self):
         self.hw.auto_ack = False
         self.assertFalse(self.drv.set_polling_rate(500))
-        self.assertEqual(len(self.sent(0x06)), 2)
+        self.assertEqual(len(self.sent(0x06)), SkillkorpM20Driver.SEND_ATTEMPTS)
         self.assertIn("confirmé", self.drv.last_error)
         self.assertEqual(self.drv.config["polling_rate"], 1000)
+
+    def test_lost_frames_are_resent_until_acknowledged(self):
+        # An idle mouse misses several frames in a row (measured on the M20).
+        self.hw.auto_ack = False
+        sends = []
+
+        def on_write(buf):
+            sends.append(buf)
+            if len(sends) == 3:
+                self.hw.input_queue.append(bytes([3, 0x10, 0x50, 0, buf[0]]))
+        self.hw.on_write = on_write
+        self.assertTrue(self.drv.set_polling_rate(500))
+        self.assertEqual(len(self.sent(0x06)), 3)
+        self.assertEqual(self.drv.config["polling_rate"], 500)
 
     def test_ack_parsing(self):
         self.assertEqual(parse_status_report(bytes([3, 0x10, 0x50, 0, 6])), {"type": "ack", "report": 6})

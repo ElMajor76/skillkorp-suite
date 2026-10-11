@@ -157,10 +157,12 @@ class KeyboardTests:
         if read_cmd and restored:
             time.sleep(0.8)
             again = self.query(read_cmd, arg)
-            ok_restore = again[1:9] == before[1:9]
-            restore_note = "restauré" if ok_restore else f"restauration différente : {hexs(again)}"
+            restored = again[1:9] == before[1:9]
+            restore_note = "restauré" if restored else f"restauration différente : {hexs(again)}"
         elif not restored:
             restore_note = f"restauration refusée ({self.drv.last_error})"
+        if not restored and verdicts is not None:
+            verdicts.append(("restauration", False))
         if verdicts is None:
             return
         if not verdicts:
@@ -273,7 +275,7 @@ class MouseTests:
             raise
         restored = restore()
         note = "restauré" if restored else f"restauration non confirmée ({self.drv.last_error})"
-        ok = all(v for _, v in verdicts)
+        ok = all(v for _, v in verdicts) and restored
         self.rep.result(name, "OK" if ok else "ÉCHEC", ", ".join(k for k, _ in verdicts) + f" ; {note}")
 
     def run(self):
@@ -283,7 +285,7 @@ class MouseTests:
             return
         mode = "2.4 GHz" if drv.is_wireless() else "câble USB-C"
         self.rep.log(f"\n{BOLD}=== Souris M20 ({mode}, {drv.dev_path}) ==={RESET}")
-        pause("Bougez la souris pour la réveiller, puis")
+        pause("Bougez la souris pour la réveiller (gardez-la à portée du récepteur), puis")
         bat = drv.get_battery(poll_hardware=True)
         self.rep.log(f"  batterie : {bat['status_str']}")
         self.rep.result("lecture batterie", "OK" if bat.get("percentage") is not None else "ÉCHEC")

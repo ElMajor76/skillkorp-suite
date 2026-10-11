@@ -12,8 +12,9 @@ Validée sur le matériel (K20 en 2.4 GHz et en filaire, M20 par récepteur).
   USB 2) de chaque appareil : les interfaces qui transportent les frappes du
   clavier et les mouvements de la souris ne sont plus lisibles par les
   programmes de la session. Les droits accordés par l'ancienne règle sont
-  retirés à l'installation ; `skillkorpctl doctor` signale toute interface de
-  saisie encore exposée.
+  retirés à l'installation (y compris l'étiquette « uaccess » qu'udev garde
+  en mémoire jusqu'au débranchement) ; `skillkorpctl doctor` signale toute
+  interface de saisie encore exposée.
 
 ### Corrigé — clavier K20
 - **Le clavier ne réagissait à aucune commande via son récepteur 2.4 GHz.**
@@ -39,7 +40,8 @@ Validée sur le matériel (K20 en 2.4 GHz et en filaire, M20 par récepteur).
   état d'alimentation de la souris lu dans son rapport batterie (attendu
   jusqu'à 2,5 s).
 - Souris : chaque écriture est vérifiée par l'accusé du récepteur
-  (`03 10 50 00`) et renvoyée une fois si besoin ; réglages d'éclairage,
+  (`03 10 50 00`) et renvoyée jusqu'à 4 fois (une souris au repos perd
+  parfois plusieurs trames d'affilée) ; réglages d'éclairage,
   absents de la M20 Ultimate, retirés de l'interface.
 - Outils : `tools/usbcapture.py` (capture usbmon des échanges de
   configuration, sans enregistrer les frappes) et `tools/hwtest.py` (test
