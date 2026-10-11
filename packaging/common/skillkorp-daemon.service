@@ -1,0 +1,14 @@
+[Unit]
+Description=SkillKorp Suite - bascule automatique des profils clavier/souris
+Documentation=man:skillkorpctl(1) https://github.com/ElMajor76/skillkorp-suite
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/skillkorpctl daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

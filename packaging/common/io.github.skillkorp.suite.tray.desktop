@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SkillKorp Suite Tray
+Comment=Indicateur de batterie et raccourcis SkillKorp (clavier K20 & souris M20)
+Exec=skillkorp-tray
+Icon=skillkorp-suite
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5

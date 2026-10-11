@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.skillkorp.suite</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>SkillKorp Suite</name>
+  <summary>Configure SkillKorp K20 Ultimate keyboard and M20 Ultimate mouse</summary>
+  <summary xml:lang="fr">Configuration du clavier SkillKorp K20 Ultimate et de la souris M20 Ultimate</summary>
+  <description>
+    <p>Unofficial Linux driver and settings application for the SkillKorp K20 Ultimate keyboard and the
+      SkillKorp M20 Ultimate mouse: lighting, polling rate, debounce, sleep timers, DPI stages, button and key
+      remapping, profiles with per-application switching, and a tray indicator with battery levels.</p>
+    <p xml:lang="fr">Pilote Linux non officiel et application de réglage du clavier SkillKorp K20 Ultimate et de
+      la souris SkillKorp M20 Ultimate : éclairage, fréquence, anti-rebond, veille, étapes DPI, remappage des
+      boutons et des touches, profils avec bascule par application et indicateur de batterie.</p>
+  </description>
+  <launchable type="desktop-id">io.github.skillkorp.suite.desktop</launchable>
+  <url type="homepage">https://github.com/ElMajor76/skillkorp-suite</url>
+  <url type="bugtracker">https://github.com/ElMajor76/skillkorp-suite/issues</url>
+  <developer id="io.github.elmajor76">
+    <name>SkillKorp Linux project</name>
+  </developer>
+  <provides>
+    <modalias>usb:v3151p4011*</modalias>
+    <modalias>usb:v3151p4015*</modalias>
+    <modalias>usb:v1D57pFA60*</modalias>
+    <modalias>usb:v1D57pFA61*</modalias>
+    <binary>skillkorpctl</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.2.0" date="2026-10-11"/>
+    <release version="1.1.0" date="2026-10-11"/>
+    <release version="1.0.1" date="2026-09-20"/>
+  </releases>
+</component>

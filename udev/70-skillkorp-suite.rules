@@ -1,0 +1,25 @@
+# udev rules for SkillKorp Suite (K20 Ultimate keyboard + M20 Ultimate mouse)
+#
+# TAG+="uaccess" lets systemd-logind give the user of the active local session
+# read/write access to the hidraw node (no root, no group to join). The tag
+# must be set before 73-seat-late.rules runs, hence the "70-" prefix: the old
+# "99-" name was evaluated too late on many distributions.
+#
+# Only the vendor configuration interface (USB interface 2) is opened up: the
+# other interfaces carry the keystrokes and pointer events, which no program
+# of the session should be able to read through hidraw. The interface is
+# matched on the modalias of the parent USB interface
+# (usb:v<VID>p<PID>...in<interface number>).
+
+ACTION=="remove", GOTO="skillkorp_end"
+SUBSYSTEM!="hidraw", GOTO="skillkorp_end"
+
+# SkillKorp K20 Ultimate keyboard: 2.4GHz receiver (3151:4011), USB cable (3151:4015)
+ATTRS{modalias}=="usb:v3151p4011*in02", MODE="0660", TAG+="uaccess"
+ATTRS{modalias}=="usb:v3151p4015*in02", MODE="0660", TAG+="uaccess"
+
+# SkillKorp M20 Ultimate mouse: 2.4GHz receiver (1d57:fa60), USB-C cable (1d57:fa61)
+ATTRS{modalias}=="usb:v1D57pFA60*in02", MODE="0660", TAG+="uaccess"
+ATTRS{modalias}=="usb:v1D57pFA61*in02", MODE="0660", TAG+="uaccess"
+
+LABEL="skillkorp_end"

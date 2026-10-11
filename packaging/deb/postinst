@@ -2,16 +2,22 @@
 set -e
 
 if [ "$1" = "configure" ]; then
+    # Rule renamed from 99- to 70- in 1.1.0 (uaccess must be set before 73-seat-late).
+    rm -f /etc/udev/rules.d/99-skillkorp-suite.rules
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload-rules || true
-        udevadm trigger --subsystem-match=hidraw || true
+        udevadm trigger --subsystem-match=hidraw --action=change || true
     fi
-    if command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database -q /usr/share/applications || true
-    fi
-    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-        gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
-    fi
+    # 1.2: only the vendor interface stays open; drop the ACLs that older rules
+    # gave on the keystroke/pointer interfaces (they would last until replug).
+    for n in /sys/class/hidraw/hidraw*; do
+        m=$(cat "$n/device/../modalias" 2>/dev/null) || continue
+        case "$m" in
+            usb:v3151p401[15]*in02|usb:v1D57pFA6[01]*in02) ;;
+            usb:v3151p401[15]*|usb:v1D57pFA6[01]*)
+                command -v setfacl >/dev/null 2>&1 && setfacl -b "/dev/${n##*/}" 2>/dev/null || true ;;
+        esac
+    done
 fi
 
 exit 0

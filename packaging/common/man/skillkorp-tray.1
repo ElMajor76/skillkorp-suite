@@ -1,0 +1,20 @@
+.TH SKILLKORP-TRAY 1 "2026-10-11" "skillkorp-suite 1.2.0" "User Commands"
+.SH NAME
+skillkorp-tray \- tray indicator for SkillKorp K20 and M20 devices
+.SH SYNOPSIS
+.B skillkorp-tray
+.SH DESCRIPTION
+Shows the battery level of both devices, low battery notifications, quick
+profile, lighting, DPI and polling rate switches, and switches profiles
+automatically from the focused application. Only one instance runs per user.
+.PP
+It is started at login (\fI/etc/xdg/autostart\fP, can be turned off from its
+menu or with \fBskillkorpctl autostart disable\fP) and by \fBskillkorp-gui\fP.
+Its Quit item also closes the \fBskillkorp-gui\fP window.
+.SH ENVIRONMENT
+.TP
+.B SKILLKORP_NO_TRAY=1
+Do not start the indicator from \fBskillkorp-gui\fP.
+.SH SEE ALSO
+.BR skillkorpctl (1),
+.BR skillkorp-gui (1)

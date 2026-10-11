@@ -1,0 +1,49 @@
+.TH SKILLKORPCTL 1 "2026-10-11" "skillkorp-suite 1.2.0" "User Commands"
+.SH NAME
+skillkorpctl \- configure the SkillKorp K20 Ultimate keyboard and M20 Ultimate mouse
+.SH SYNOPSIS
+.B skillkorpctl
+.RB [ \-\-json ]
+.RI [ command " [" options ]]
+.SH DESCRIPTION
+.B skillkorpctl
+talks to the keyboard and mouse through
+.IR /dev/hidraw* .
+Without a command it prints a combined status.
+.SH COMMANDS
+.TP
+.B status
+Overview of both devices.
+.TP
+.BI "keyboard " subcommand
+status, info, battery, rgb, side\-rgb, polling\-rate, debounce, sleep, win\-lock,
+wasd\-swap, os\-mode, gaming\-mode, remap, reset, apply, profile.
+.TP
+.BI "mouse " subcommand
+status, battery, dpi, rate, sensor, light, power, button, restore\-buttons, monitor, apply, profile.
+.TP
+.B daemon
+Switch profiles automatically from the focused application.
+.TP
+.B doctor
+Check the udev rule, device access and optional tools.
+.TP
+.BR "tray " { start | stop | status }
+Control the tray indicator.
+.TP
+.BR "autostart " { enable | disable | status }
+Start the tray indicator with the session.
+.PP
+Run
+.B skillkorpctl
+.I command
+.B \-\-help
+for the options of each command.
+.SH EXIT STATUS
+0 success, 1 invalid value, 2 device missing or not accessible,
+3 command refused by the device, 130 interrupted.
+.SH FILES
+.I ~/.config/skillkorp/
+.SH SEE ALSO
+.BR skillkorp-gui (1),
+.BR skillkorp-tray (1)
