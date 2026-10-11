@@ -266,13 +266,15 @@ class TestWireless(KeyboardTestCase):
     def test_init_once_then_poll_before_each_frame(self):
         # Sequence captured from the vendor software.
         self.drv.set_debounce(4)
-        self.assertEqual(self.commands(), self.INIT + [CMD_SET_DEBOUNCE])
+        self.assertEqual(self.commands()[:5], self.INIT + [CMD_SET_DEBOUNCE])
+        self.assertEqual(self.commands()[5:], [0xF7, 0x91, 0xF7, 0xFC])  # readback check
         self.assertEqual(self.hw.writes[1][1:3], bytes([0xFE, 64]))
         self.assertEqual(self.hw.writes[3][1:3], bytes([0xF6, 0x0A]))
         self.assertTrue(all(len(w) == 65 for w in self.hw.writes))
         self.hw.writes.clear()
         self.drv.set_debounce(5)
-        self.assertEqual(self.commands(), [0xF7, CMD_SET_DEBOUNCE])
+        self.assertEqual(self.commands()[:2], [0xF7, CMD_SET_DEBOUNCE])
+        self.assertNotIn(0xFE, self.commands())
 
     def test_wireless_read_fetches_answer(self):
         self.hw.answers[0x80] = bytes([0x80, 0x09, 0x01])
@@ -281,6 +283,23 @@ class TestWireless(KeyboardTestCase):
         self.assertEqual(cmds[:5], self.INIT + [0x80])
         self.assertEqual(cmds[-2:], [0xF7, 0xFC])
         self.assertIsNone(self.hw.rf_pending)
+
+    def test_lost_write_is_resent_after_readback(self):
+        # A frame relayed while the keyboard sends keystrokes can be lost
+        # silently (seen with tools/hwtest.py): the readback catches it.
+        self.hw.rf_lose_writes = 1
+        self.assertTrue(self.drv.set_rgb(mode="static", color="#00FF00", colorful=False))
+        leds = [p for p in self.hw.payloads() if p[0] == CMD_SET_LEDPARAM]
+        self.assertEqual(len(leds), 2)
+        self.assertEqual(self.hw.answers[0x87][5:8], bytes([0, 255, 0]))
+
+    def test_write_never_applied_fails(self):
+        self.hw.rf_lose_writes = 10
+        self.assertFalse(self.drv.set_debounce(4))
+        self.assertIn("pas appliqué", self.drv.last_error)
+        self.assertNotEqual(self.drv.config.get("debounce_ms"), 4)
+        self.assertEqual(len([p for p in self.hw.payloads() if p[0] == CMD_SET_DEBOUNCE]),
+                         kb.RF_WRITE_ATTEMPTS)
 
     def test_wireless_read_timeout(self):
         self.hw.rf_keyboard_answers = False
@@ -297,7 +316,7 @@ class TestWireless(KeyboardTestCase):
         # An unread answer blocks the real receiver: it must be fetched first.
         self.hw.rf_pending = bytes([0x91, 0x00, 0x08])
         self.assertTrue(self.drv.set_debounce(4))
-        self.assertEqual(self.commands(), self.INIT + [0xFC, 0xF7, CMD_SET_DEBOUNCE])
+        self.assertEqual(self.commands()[:7], self.INIT + [0xFC, 0xF7, CMD_SET_DEBOUNCE])
         self.assertIsNone(self.hw.rf_pending)
 
     ASLEEP = bytes([0, 0x54, 0, 1, 1, 1, 1, 0x90, 6])  # captured while off/asleep
@@ -367,7 +386,7 @@ class TestWireless(KeyboardTestCase):
         self.assertEqual((frame[2] & 0x05, frame[3], frame[4]), (0x05, 0x02, 0x81))
 
     def test_options_fall_back_to_bits_saved_over_cable(self):
-        self.hw.rf_keyboard_answers = False
+        self.hw.rf_ignore_queries = 1  # the options read goes unanswered
         self.drv.commit({"options_raw": [0x04, 0x02, 0x81]})
         clock = [0.0]
 

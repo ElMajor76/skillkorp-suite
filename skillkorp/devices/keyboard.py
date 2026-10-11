@@ -131,6 +131,22 @@ RF_STATUS_REPLY_READY = 0       # 1 = an answer from the keyboard is waiting
 RF_STATUS_BATTERY = 1           # battery percentage
 RF_STATUS_OFFLINE = 3           # non-zero while the keyboard is off or asleep
 RF_REPLY_TIMEOUT = 1.5          # max wait for the keyboard's answer over the air
+RF_WRITE_ATTEMPTS = 3           # verified writes over the air (frames can be lost)
+
+# How to read back what a SET frame wrote: GET command, its argument taken
+# from the frame, and the check. Used to verify writes over the receiver: a
+# frame relayed while the keyboard is busy (e.g. sending keystrokes) can be
+# lost without any error, measured with tools/hwtest.py. Over the air the
+# readback reflects a write ~1.2 s after it was sent.
+WRITE_READBACK = {
+    0x07: (0x87, lambda f: 0, lambda f, r: r[1:8] == f[1:8]),          # backlight
+    0x08: (0x88, lambda f: 0, lambda f, r: r[1:8] == f[1:8]),          # side LEDs
+    0x04: (0x84, lambda f: f[1], lambda f, r: r[2] == f[2]),           # polling rate
+    0x05: (0x85, lambda f: 0, lambda f, r: r[1] == f[1]),              # hardware profile
+    0x06: (0x86, lambda f: f[1], lambda f, r: r[2:5] == f[2:5]),       # options
+    0x11: (0x91, lambda f: 0, lambda f, r: r[2] == f[2]),              # debounce
+    0x12: (0x92, lambda f: 0, lambda f, r: r[1:9] == f[8:16]),         # sleep timers
+}
 
 # Delays observed in the vendor code after each command (COMMONDELAY /
 # BIGCMDDELAY): the firmware writes its flash and drops frames meanwhile.
@@ -724,12 +740,33 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
             payloads = [payloads]
         self._wait_command_gap(getattr(self, "_pending_gap", 0.0))
         with self.open_device() as dev:
+            wireless = dev.node.product_id == PID_WIRELESS
             for i, payload in enumerate(payloads):
                 if i:
                     time.sleep(DELAY_KEY)
                 self._write_frame(dev, payload)
+                if wireless and payload[0] in WRITE_READBACK:
+                    self._rf_verify(dev, payload)
+                    settle = 0.0  # the keyboard has applied it already
         self._last_command_end = time.monotonic()
         self._pending_gap = settle
+
+    def _rf_verify(self, dev, frame: bytes) -> None:
+        """Read back a frame written over the air, resend it when it was lost."""
+        get_cmd, arg, matches = WRITE_READBACK[frame[0]]
+        for attempt in range(RF_WRITE_ATTEMPTS):
+            try:
+                reply = self._rf_query(dev, get_cmd, arg(frame))
+                if len(reply) > 16 and reply[0] == get_cmd and matches(frame, reply):
+                    return
+            except KeyboardOfflineError:
+                raise
+            except DeviceError:
+                pass  # no answer: the keyboard may still be busy, resend anyway
+            if attempt + 1 < RF_WRITE_ATTEMPTS:
+                self._write_frame(dev, frame)
+        raise DeviceError("Le clavier n'a pas appliqué le réglage (liaison radio perturbée ?). "
+                          "Réessayez.")
 
     def _send_feature_report(self, payload: bytes, checksum_type: Optional[str] = "bit7") -> bool:
         """Compatibility wrapper: checksum + send, returns True/False."""

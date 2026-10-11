@@ -63,6 +63,14 @@ récupérée par `FC` bloque le récepteur : il ignore alors toutes les trames
 suivantes, même après débranchement du récepteur ou redémarrage du clavier,
 jusqu'à ce que la réponse soit lue. Le pilote la récupère avant chaque envoi.
 
+Une trame relayée pendant que le clavier transmet des frappes peut être
+perdue sans aucune erreur (observé avec `tools/hwtest.py` : la restauration
+envoyée juste après une réponse tapée sur le K20 n'était pas appliquée).
+Chaque écriture sans fil est donc relue (la relecture reflète l'écriture
+~1,2 s après l'envoi) et renvoyée jusqu'à 3 fois si elle ne correspond pas.
+Les remappages (0x13/0x15) ne sont pas encore vérifiés ainsi : la
+disposition de leur relecture n'est pas connue.
+
 ## 2. Bugs de protocole — souris M20
 
 | # | Gravité | Problème (1.0.1) | Preuve (`MU_SkillKorp.exe`) | Correction |

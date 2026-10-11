@@ -16,7 +16,7 @@ optdepends=(
 checkdepends=('python')
 backup=('etc/xdg/autostart/io.github.skillkorp.suite.tray.desktop')
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('725045a03bb64017884d3ffe4f3aead58f3d7531a89bcb088b2ad2c79ef19f72')
+sha256sums=('bbe024b56daca7c211efde0cb4dfc1fd45c0eb7f29e0393c0b9dedefa9b18afd')
 
 check() {
     cd "$srcdir/$pkgname-$pkgver"

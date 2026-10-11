@@ -98,6 +98,8 @@ class FakeHardware:
         self.rf_pending: Optional[bytes] = None
         self.rf_buffer = b""
         self.rf_keyboard_answers = True
+        self.rf_lose_writes = 0  # next N keyboard writes lost over the air
+        self.rf_ignore_queries = 0  # next N GET commands left unanswered
 
     @property
     def is_receiver(self) -> bool:
@@ -114,8 +116,23 @@ class FakeHardware:
                 self.rf_buffer, self.rf_pending = self.rf_pending, None
         elif cmd in (0xFE, 0xF6):
             pass
+        elif cmd & 0x80 and self.rf_ignore_queries:
+            self.rf_ignore_queries -= 1
         elif cmd & 0x80 and self.rf_keyboard_answers:
             self.rf_pending = self.answers.get(cmd, bytes([cmd]))
+        elif self.rf_lose_writes:
+            self.rf_lose_writes -= 1
+        else:
+            self.keyboard_applies(frame[1:])
+
+    def keyboard_applies(self, p: bytes) -> None:
+        """The keyboard's state as later read back (same layouts as the K20)."""
+        state = {0x07: lambda: bytes([0x87]) + p[1:8], 0x08: lambda: bytes([0x88]) + p[1:8],
+                 0x04: lambda: bytes([0x84, p[1], p[2]]), 0x05: lambda: bytes([0x85, p[1]]),
+                 0x06: lambda: bytes([0x86]) + p[1:5], 0x11: lambda: bytes([0x91, 0, p[2]]),
+                 0x12: lambda: bytes([0x92]) + p[8:16]}
+        if p[0] in state:
+            self.answers[p[0] | 0x80] = state[p[0]]()
 
     def feature_answer(self, last_frame: bytes) -> bytes:
         """Answer to a GET_FEATURE: payload registered for the last command byte."""
@@ -126,11 +143,14 @@ class FakeHardware:
         return b"\x00" + payload.ljust(64, b"\x00")
 
     def payloads(self, skip_prefix: bool = True) -> List[bytes]:
-        """Keyboard payloads (report ID stripped), receiver commands removed."""
+        """Keyboard payloads (report ID stripped), receiver commands removed;
+        over the receiver, the GET frames used to verify writes too."""
         out = []
         for w in self.writes:
             p = w[1:]
             if skip_prefix and p[0] in (0xFE, 0xF6, 0xF7, 0xFC):
+                continue
+            if skip_prefix and self.is_receiver and p[0] & 0x80:
                 continue
             out.append(p)
         return out
