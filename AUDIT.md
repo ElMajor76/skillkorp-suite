@@ -164,17 +164,21 @@ DPI/50−1 sur deux tableaux, étape active, couleurs, checksum 16 bits octets
   PKGBUILD), métadonnées AppStream, service utilisateur systemd
   `skillkorp-daemon.service`, construction reproductible.
 
-## 6. Limites connues
+## 6. Validation sur le matériel et limites connues
 
-* Validé sur le matériel : clavier en filaire et en 2.4 GHz (lectures,
-  éclairage confirmé visuellement et par relecture/accusés), souris par
-  récepteur (batterie, accusés `03 10 50 00 <rapport>` de chaque écriture).
-  Les autres réglages utilisent les mêmes trames que le code officiel mais
-  n'ont pas tous été essayés un par un. Vérification après installation :
-  `skillkorpctl doctor`.
+* Validé avec `tools/hwtest.py` (chaque réglage appliqué, vérifié par
+  relecture ou observation, puis restauré) : clavier en filaire et en
+  2.4 GHz (éclairage, bandes latérales, fréquence, anti-rebond, veille,
+  verrouillage Windows, remappages normal et Fn : 18/18), souris par
+  récepteur et en USB-C (DPI, fréquence, anti-rebond, veille, boutons, avec
+  l'accusé `03 10 50 00 <rapport>` de chaque écriture), accès udev limité à
+  l'interface 2 sur les deux récepteurs et les deux câbles.
 * La M20 Ultimate n'a pas d'éclairage RGB : la GUI ne propose plus ces
   réglages (le rapport 0x05 reste envoyé pour la veille et l'anti-rebond).
-* Rapport 0x08 (boutons de la souris) : disposition reprise de la version
-  précédente, non revérifiée instruction par instruction.
-* Clavier en 2.4 GHz : les commandes échouent (message explicite) tant que
-  le clavier dort ; il suffit d'appuyer sur une touche.
+* Remappages du clavier en 2.4 GHz : pas de relecture de vérification (la
+  disposition de la réponse à 0x93/0x95 n'est pas connue) ; ils profitent
+  toutefois de l'attente de transmission par le récepteur.
+* Clavier endormi en 2.4 GHz : les réglages sont enregistrés et appliqués à
+  son réveil (indicateur, application ou `skillkorpctl keyboard sync`).
+* GNOME Wayland : la bascule automatique des profils demande l'extension
+  fournie (chargée par GNOME à la connexion suivant son installation).

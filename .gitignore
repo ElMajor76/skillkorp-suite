@@ -17,3 +17,6 @@ __pycache__/
 
 # Packaging build artifacts
 /dist/
+
+# Hardware test reports (tools/hwtest.py)
+skillkorp-hwtest-*.txt

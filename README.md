@@ -27,6 +27,11 @@ l'utilisateur de la session.
 
 ### Paquets prêts à l'emploi
 
+Téléchargez le paquet de votre distribution depuis la page
+[**Releases**](https://github.com/ElMajor76/skillkorp-suite/releases/latest)
+(avec `SHA256SUMS` pour vérifier les fichiers : `sha256sum -c --ignore-missing SHA256SUMS`),
+puis installez-le depuis le dossier de téléchargement :
+
 | Distribution | Paquet | Commande |
 |---|---|---|
 | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS | `skillkorp-suite_1.2.0-1_all.deb` | `sudo apt install ./skillkorp-suite_1.2.0-1_all.deb` |
@@ -35,8 +40,9 @@ l'utilisateur de la session.
 | Arch, Manjaro, EndeavourOS | `skillkorp-suite-1.2.0-1-any.pkg.tar.zst` | `sudo pacman -U ./skillkorp-suite-1.2.0-1-any.pkg.tar.zst` |
 | Arch (depuis les sources) | `PKGBUILD` + archive source | `makepkg -si` dans le dossier contenant les deux |
 
-Après l'installation, **débranchez puis rebranchez** le récepteur (ou le
-câble), puis vérifiez :
+Mise à jour depuis une version précédente : même commande avec le nouveau
+paquet. Après l'installation, **débranchez puis rebranchez** les récepteurs
+(ou les câbles), puis vérifiez :
 
 ```bash
 skillkorpctl doctor
@@ -199,6 +205,14 @@ python3 -m unittest discover -s tests -t . -v
 Les tests utilisent un faux périphérique HID (`tests/fakes.py`) qui enregistre
 les trames : aucun matériel n'est nécessaire et aucun périphérique réel n'est
 touché.
+
+Test sur le vrai matériel, guidé (chaque réglage est restauré après son
+test, un rapport est écrit dans le dossier courant) :
+
+```bash
+python3 tools/hwtest.py                 # clavier, souris, puis câbles
+python3 tools/hwtest.py --only keyboard --no-cables
+```
 
 ## 📄 Licence
 
