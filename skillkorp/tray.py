@@ -2,54 +2,66 @@
 """
 SkillKorp Suite - Unified System Tray Indicator & Notifications
 
-A single AppIndicator process manages both devices (replacing the separate
-k20_tray.py and m20_tray.py processes):
-- Combined battery label in the panel (e.g. "⌨82% 🖱91%")
-- Submenus "Clavier" and "Souris", each with their own profile/RGB/DPI/
-  polling-rate quick switches
-- Low battery alerts & charging notifications, independently per device
-- One shared active-window watch drives auto-switching for both devices
-- One "Ouvrir SkillKorp Suite..." entry, one autostart toggle, one Quit
+One AppIndicator for both devices:
+- only the SkillKorp logo in the panel; battery levels in the menu (and in
+  the indicator title, used as tooltip/accessible name by some panels)
+- "Clavier" and "Souris" submenus: profiles, lighting, polling rate, DPI...
+- low battery alerts and connection notifications per device
+- per-application automatic profile switching (shared AutoSwitcher)
+
+Hardware I/O runs in DeviceWorker threads; the GTK main loop never blocks.
+A single instance runs per user (lock on the PID file).
 """
 
+import fcntl
 import os
-import sys
+import signal
 import subprocess
-from typing import Optional
+import sys
+from typing import Any, Dict, Optional
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-import gi
+import gi  # noqa: E402
+
 gi.require_version("Gtk", "3.0")
 try:
     gi.require_version("AyatanaAppIndicator3", "0.1")
-    from gi.repository import AyatanaAppIndicator3 as appindicator
-except Exception:
-    gi.require_version("AppIndicator3", "0.1")
-    from gi.repository import AppIndicator3 as appindicator
+    from gi.repository import AyatanaAppIndicator3 as appindicator  # noqa: E402
+except (ValueError, ImportError):
+    try:
+        gi.require_version("AppIndicator3", "0.1")
+        from gi.repository import AppIndicator3 as appindicator  # noqa: E402
+    except (ValueError, ImportError):
+        appindicator = None
 
-from gi.repository import Gtk, GLib
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
+
 try:
     gi.require_version("Notify", "0.7")
-    from gi.repository import Notify
+    from gi.repository import Notify  # noqa: E402
     HAS_NOTIFY = True
-except Exception:
+except (ValueError, ImportError):
     HAS_NOTIFY = False
 
-from skillkorp.devices.keyboard import SkillkorpK20Driver, LIGHT_MODES as KB_LIGHT_MODES
-from skillkorp.devices.mouse import SkillkorpM20Driver
-from skillkorp.profiles.manager import (
+from skillkorp.devices.hidraw import DeviceError  # noqa: E402
+from skillkorp.devices.keyboard import SkillkorpK20Driver, LIGHT_MODES as KB_LIGHT_MODES  # noqa: E402
+from skillkorp.devices.mouse import SkillkorpM20Driver  # noqa: E402
+from skillkorp.profiles.manager import (  # noqa: E402
+    AutoSwitcher,
     ProfileManager,
-    detect_active_window_class,
-    find_matching_profile,
     is_autostart_enabled,
     set_autostart,
 )
-from skillkorp.profiles.migration import migrate_legacy_configs
+from skillkorp.profiles.migration import migrate_legacy_configs  # noqa: E402
+from skillkorp.traylaunch import GUI_APP_ID, GUI_OBJECT_PATH, pid_file  # noqa: E402
+from skillkorp.worker import DeviceWorker  # noqa: E402
 
-PID_FILE = os.path.join(os.path.expanduser("~/.config/skillkorp"), "tray.pid")
+STATUS_PERIOD_S = 5
+BATTERY_PERIOD_S = 60
+AUTOSWITCH_PERIOD_MS = 1000
 
 
 class SkillkorpSuiteTray:
@@ -58,360 +70,386 @@ class SkillkorpSuiteTray:
         self.mouse_driver = SkillkorpM20Driver()
         self.kb_pm = ProfileManager("keyboard")
         self.mouse_pm = ProfileManager("mouse")
-
+        self.kb_worker = DeviceWorker("tray-keyboard", GLib.idle_add)
+        self.mouse_worker = DeviceWorker("tray-mouse", GLib.idle_add)
+        self.state: Dict[str, Dict[str, Any]] = {"keyboard": {}, "mouse": {}}
+        self.warned: Dict[str, int] = {"keyboard": 100, "mouse": 100}
+        self._ticks = 0
         if HAS_NOTIFY:
             Notify.init("SkillKorp Suite")
 
-        self.last_kb_connected: Optional[bool] = None
-        self.last_mouse_connected: Optional[bool] = None
-        self.kb_warned_low_20 = False
-        self.kb_warned_low_10 = False
-        self.mouse_warned_low_20 = False
-        self.mouse_warned_low_10 = False
-        self.last_active_window: Optional[str] = None
+        # The switcher runs in its own worker with its own driver instances, so a
+        # driver object is never used from two threads (the device itself is
+        # serialized by the hidraw lock).
+        self.switch_worker = DeviceWorker("tray-autoswitch", GLib.idle_add)
+        self.switcher = AutoSwitcher([(ProfileManager("keyboard"), self._ConnectedOnly(SkillkorpK20Driver())),
+                                      (ProfileManager("mouse"), self._ConnectedOnly(SkillkorpM20Driver()))],
+                                     on_switch=self._on_auto_switched)
+        self._switch_busy = False
 
         self.indicator = appindicator.Indicator.new(
-            "skillkorp-suite-tray",
-            "skillkorp-suite",
-            appindicator.IndicatorCategory.HARDWARE,
-        )
+            "skillkorp-suite-tray", "skillkorp-suite", appindicator.IndicatorCategory.HARDWARE)
         self.indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
         self.indicator.set_title("SkillKorp Suite")
-
-        icon_path = os.path.join(BASE_DIR, "assets", "skillkorp-k20.png")
-        if os.path.exists(icon_path):
-            self.indicator.set_icon_full(icon_path, "SkillKorp Suite")
+        if not Gtk.IconTheme.get_default().has_icon("skillkorp-suite"):
+            icon = os.path.join(BASE_DIR, "assets", "skillkorp-suite.png")
+            if os.path.exists(icon):
+                self.indicator.set_icon_full(icon, "SkillKorp Suite")
 
         self.menu = Gtk.Menu()
         self._build_menu()
         self.indicator.set_menu(self.menu)
 
-        self._update_status()
+        self._poll(force_battery=True)
+        GLib.timeout_add_seconds(STATUS_PERIOD_S, self._on_status_timer)
+        GLib.timeout_add(AUTOSWITCH_PERIOD_MS, self._on_auto_switch_timer)
 
-        GLib.timeout_add_seconds(4, self._on_status_timer)
-        GLib.timeout_add(1000, self._on_auto_switch_timer)
+    class _ConnectedOnly:
+        def __init__(self, drv):
+            self.drv = drv
 
+        def apply_profile(self, prof):
+            return self.drv.apply_profile(prof) if self.drv.is_connected() else True
+
+    # ------------------------------------------------------------------ utils
     def _notify(self, title: str, body: str, urgency: int = 1):
         if not HAS_NOTIFY:
             return
         try:
             n = Notify.Notification.new(title, body, "skillkorp-suite")
             n.set_urgency(urgency)
-            n.set_timeout(3000)
+            n.set_timeout(4000)
             n.show()
-        except Exception:
+        except GLib.Error:
             pass
 
-    # -------------------------------------------------------------------
-    # Menu construction
-    # -------------------------------------------------------------------
+    def _run(self, device: str, func, ok_msg: Optional[str] = None):
+        worker = self.kb_worker if device == "keyboard" else self.mouse_worker
+        driver = self.kb_driver if device == "keyboard" else self.mouse_driver
+        label = "Clavier" if device == "keyboard" else "Souris"
+
+        def done(success):
+            if success is False:
+                self._notify(f"{label} : commande refusée", driver.last_error or "Le périphérique n'a pas répondu.")
+            elif getattr(driver, "last_deferred", False):
+                self._notify(label, "Clavier en veille : réglage enregistré, il sera appliqué à son réveil.")
+            elif ok_msg:
+                self._notify(label, ok_msg)
+            self._refresh_menus()
+
+        def failed(exc):
+            self._notify(f"{label} : erreur", str(exc))
+        worker.submit(func, done, failed)
+
+    # --------------------------------------------------------------- menu
+    def _item(self, label: str, callback=None, sensitive: bool = True) -> Gtk.MenuItem:
+        item = Gtk.MenuItem(label=label)
+        if callback:
+            item.connect("activate", lambda w: callback())
+        item.set_sensitive(sensitive)
+        return item
+
+    @staticmethod
+    def _icon_item(icon_name: str, label: str) -> Gtk.MenuItem:
+        """Read-only menu line with a themed icon (exported by the indicator)."""
+        item = Gtk.ImageMenuItem(label=label)
+        item.set_image(Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.MENU))
+        item.set_always_show_image(True)
+        item.set_sensitive(False)
+        return item
+
     def _build_menu(self):
-        # Battery headers
-        self.item_kb_battery = Gtk.MenuItem(label="⌨ Clavier : --%")
-        self.item_kb_battery.set_sensitive(False)
+        self.item_kb_battery = self._icon_item("input-keyboard", "Clavier : …")
+        self.item_mouse_battery = self._icon_item("input-mouse", "Souris : …")
         self.menu.append(self.item_kb_battery)
-
-        self.item_mouse_battery = Gtk.MenuItem(label="🖱 Souris : --%")
-        self.item_mouse_battery.set_sensitive(False)
         self.menu.append(self.item_mouse_battery)
-
         self.menu.append(Gtk.SeparatorMenuItem())
 
-        # Keyboard submenu
-        item_kb = Gtk.MenuItem(label="Clavier")
-        kb_submenu = Gtk.Menu()
-
-        self.kb_profile_item = Gtk.MenuItem(label="Profil : Par défaut")
-        self.kb_profile_submenu = Gtk.Menu()
-        self._populate_profile_submenu(self.kb_profile_submenu, self.kb_pm, self._on_select_kb_profile)
-        self.kb_profile_item.set_submenu(self.kb_profile_submenu)
-        kb_submenu.append(self.kb_profile_item)
-
-        item_kb_rgb = Gtk.MenuItem(label="Éclairage RGB")
-        kb_rgb_submenu = Gtk.Menu()
+        kb_item = Gtk.MenuItem(label="Clavier")
+        kb_menu = Gtk.Menu()
+        self.kb_profile_item = Gtk.MenuItem(label="Profil")
+        self.kb_profile_menu = Gtk.Menu()
+        self.kb_profile_item.set_submenu(self.kb_profile_menu)
+        kb_menu.append(self.kb_profile_item)
+        rgb_item = Gtk.MenuItem(label="Éclairage")
+        rgb_menu = Gtk.Menu()
         for key, name, _ in KB_LIGHT_MODES:
-            sub_item = Gtk.MenuItem(label=name)
-            sub_item.connect("activate", lambda w, k=key: self._on_select_kb_rgb(k))
-            kb_rgb_submenu.append(sub_item)
-        item_kb_rgb.set_submenu(kb_rgb_submenu)
-        kb_submenu.append(item_kb_rgb)
+            rgb_menu.append(self._item(name, lambda k=key, n=name: self._run(
+                "keyboard", lambda: self.kb_driver.set_rgb(mode=k), f"Éclairage : {n}")))
+        rgb_item.set_submenu(rgb_menu)
+        kb_menu.append(rgb_item)
+        rate_item = Gtk.MenuItem(label="Taux de rafraîchissement")
+        rate_menu = Gtk.Menu()
+        for hz in (1000, 500, 250, 125):
+            rate_menu.append(self._item(f"{hz} Hz", lambda r=hz: self._run(
+                "keyboard", lambda: self.kb_driver.set_polling_rate(r), f"{r} Hz")))
+        rate_item.set_submenu(rate_menu)
+        kb_menu.append(rate_item)
+        self.kb_winlock = Gtk.CheckMenuItem(label="Verrouiller la touche Windows")
+        self._winlock_handler = self.kb_winlock.connect("toggled", self._on_toggle_winlock)
+        kb_menu.append(self.kb_winlock)
+        kb_item.set_submenu(kb_menu)
+        self.menu.append(kb_item)
 
-        item_kb_poll = Gtk.MenuItem(label="Taux de rafraîchissement")
-        kb_poll_submenu = Gtk.Menu()
-        for hz in [1000, 500, 250, 125]:
-            sub_item = Gtk.MenuItem(label=f"{hz} Hz")
-            sub_item.connect("activate", lambda w, r=hz: self._on_select_kb_poll(r))
-            kb_poll_submenu.append(sub_item)
-        item_kb_poll.set_submenu(kb_poll_submenu)
-        kb_submenu.append(item_kb_poll)
-
-        self.kb_win_lock_item = Gtk.CheckMenuItem(label="Verrouiller touche Windows")
-        self.kb_win_lock_item.connect("toggled", self._on_toggle_kb_win_lock)
-        kb_submenu.append(self.kb_win_lock_item)
-
-        item_kb.set_submenu(kb_submenu)
-        self.menu.append(item_kb)
-
-        # Mouse submenu
-        item_mouse = Gtk.MenuItem(label="Souris")
-        mouse_submenu = Gtk.Menu()
-
-        self.mouse_profile_item = Gtk.MenuItem(label="Profil : Par défaut")
-        self.mouse_profile_submenu = Gtk.Menu()
-        self._populate_profile_submenu(self.mouse_profile_submenu, self.mouse_pm, self._on_select_mouse_profile)
-        self.mouse_profile_item.set_submenu(self.mouse_profile_submenu)
-        mouse_submenu.append(self.mouse_profile_item)
-
-        self.mouse_dpi_item = Gtk.MenuItem(label="Sensibilité DPI")
-        self.mouse_dpi_submenu = Gtk.Menu()
-        self.mouse_dpi_item.set_submenu(self.mouse_dpi_submenu)
-        mouse_submenu.append(self.mouse_dpi_item)
-
-        item_mouse_poll = Gtk.MenuItem(label="Taux de rapport")
-        mouse_poll_submenu = Gtk.Menu()
-        for hz in [1000, 500, 250, 125]:
-            sub_item = Gtk.MenuItem(label=f"{hz} Hz")
-            sub_item.connect("activate", lambda w, r=hz: self._on_select_mouse_rate(r))
-            mouse_poll_submenu.append(sub_item)
-        item_mouse_poll.set_submenu(mouse_poll_submenu)
-        mouse_submenu.append(item_mouse_poll)
-
-        item_mouse.set_submenu(mouse_submenu)
-        self.menu.append(item_mouse)
+        mouse_item = Gtk.MenuItem(label="Souris")
+        mouse_menu = Gtk.Menu()
+        self.mouse_profile_item = Gtk.MenuItem(label="Profil")
+        self.mouse_profile_menu = Gtk.Menu()
+        self.mouse_profile_item.set_submenu(self.mouse_profile_menu)
+        mouse_menu.append(self.mouse_profile_item)
+        dpi_item = Gtk.MenuItem(label="Sensibilité DPI")
+        self.mouse_dpi_menu = Gtk.Menu()
+        dpi_item.set_submenu(self.mouse_dpi_menu)
+        mouse_menu.append(dpi_item)
+        mrate_item = Gtk.MenuItem(label="Taux de rapport")
+        mrate_menu = Gtk.Menu()
+        for hz in (1000, 500, 250, 125):
+            mrate_menu.append(self._item(f"{hz} Hz", lambda r=hz: self._run(
+                "mouse", lambda: self.mouse_driver.set_polling_rate(r), f"{r} Hz")))
+        mrate_item.set_submenu(mrate_menu)
+        mouse_menu.append(mrate_item)
+        mouse_item.set_submenu(mouse_menu)
+        self.menu.append(mouse_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
-
-        item_open_gui = Gtk.MenuItem(label="Ouvrir SkillKorp Suite...")
-        item_open_gui.connect("activate", self._on_open_gui)
-        self.menu.append(item_open_gui)
-
+        self.menu.append(self._item("Ouvrir SkillKorp Suite…", self._open_gui))
+        self.item_autoswitch = Gtk.CheckMenuItem(label="Bascule automatique des profils")
+        self.item_autoswitch.set_active(self.kb_pm.is_auto_switch_enabled() or self.mouse_pm.is_auto_switch_enabled())
+        self.item_autoswitch.connect("toggled", self._on_toggle_autoswitch)
+        self.menu.append(self.item_autoswitch)
         self.item_autostart = Gtk.CheckMenuItem(label="Lancer avec la session")
         self.item_autostart.set_active(is_autostart_enabled())
-        self.item_autostart.connect("toggled", self._on_toggle_autostart)
+        self.item_autostart.connect("toggled", lambda i: set_autostart(i.get_active()))
         self.menu.append(self.item_autostart)
-
         self.menu.append(Gtk.SeparatorMenuItem())
-
-        item_quit = Gtk.MenuItem(label="Quitter")
-        item_quit.connect("activate", self._on_quit)
-        self.menu.append(item_quit)
-
+        self.menu.append(self._item("Quitter", self._quit_all))
         self.menu.show_all()
-        self._populate_dpi_submenu()
+        self._refresh_menus()
 
-    def _populate_profile_submenu(self, submenu: Gtk.Menu, pm: ProfileManager, callback):
-        for child in submenu.get_children():
-            submenu.remove(child)
-        profiles = pm.list_profiles()
-        active_id = pm.get_active_profile_id()
-        for p in profiles:
-            p_id = p["id"]
-            p_name = p.get("name", p_id)
-            label = f"✓ {p_name}" if p_id == active_id else f"   {p_name}"
-            sub_item = Gtk.MenuItem(label=label)
-            sub_item.connect("activate", lambda w, pid=p_id: callback(pid))
-            submenu.append(sub_item)
-        submenu.show_all()
+    def _fill_profiles(self, menu: Gtk.Menu, pm: ProfileManager, device: str):
+        for child in menu.get_children():
+            menu.remove(child)
+        active = pm.get_active_profile_id()
+        driver = self.kb_driver if device == "keyboard" else self.mouse_driver
+        for p in pm.list_profiles():
+            pid, name = p["id"], p.get("name", p["id"])
+            label = f"✓ {name}" if pid == active else f"   {name}"
 
-    def _populate_dpi_submenu(self):
-        for child in self.mouse_dpi_submenu.get_children():
-            self.mouse_dpi_submenu.remove(child)
-        stages = self.mouse_driver.config.get("dpi_stages", [400, 800, 1600, 3200, 6400, 26000])
-        active_stage = self.mouse_driver.config.get("active_stage", 2)
-        for idx, dpi in enumerate(stages):
-            stage_num = idx + 1
-            label = f"✓ Étape {stage_num} : {dpi} DPI" if stage_num == active_stage else f"   Étape {stage_num} : {dpi} DPI"
-            sub_item = Gtk.MenuItem(label=label)
-            sub_item.connect("activate", lambda w, s=stage_num: self._on_select_mouse_dpi_stage(s))
-            self.mouse_dpi_submenu.append(sub_item)
-        self.mouse_dpi_submenu.show_all()
+            def switch(i=pid, n=name):
+                def task():
+                    pm.switch_profile(i, driver=self._ConnectedOnly(driver))
+                    return pm.last_apply_ok
+                self._run(device, task, f"Profil « {n} » appliqué")
+            menu.append(self._item(label, switch))
+        menu.show_all()
 
-    # -------------------------------------------------------------------
-    # Status polling
-    # -------------------------------------------------------------------
-    def _update_status(self):
-        self.kb_driver.reload_config_if_changed()
+    def _refresh_menus(self):
+        for pm, item, menu, dev in ((self.kb_pm, self.kb_profile_item, self.kb_profile_menu, "keyboard"),
+                                    (self.mouse_pm, self.mouse_profile_item, self.mouse_profile_menu, "mouse")):
+            pid = pm.get_active_profile_id()
+            prof = pm.get_profile(pid)
+            item.set_label(f"Profil : {prof.get('name', pid) if prof else pid}")
+            self._fill_profiles(menu, pm, dev)
+
+        for child in self.mouse_dpi_menu.get_children():
+            self.mouse_dpi_menu.remove(child)
         self.mouse_driver.reload_config_if_changed()
+        stages = self.mouse_driver.config.get("dpi_stages", [])
+        active = self.mouse_driver.config.get("active_stage", 1)
+        for idx, dpi in enumerate(stages, start=1):
+            label = f"{'✓' if idx == active else '   '} Étape {idx} : {dpi} DPI"
+            self.mouse_dpi_menu.append(self._item(label, lambda s=idx, d=dpi: self._run(
+                "mouse", lambda: self.mouse_driver.set_dpi_and_sensor(active_stage=s), f"{d} DPI")))
+        self.mouse_dpi_menu.show_all()
 
-        kb_connected = self.kb_driver.is_connected()
-        kb_bat = self.kb_driver.get_battery()
-        kb_pct = kb_bat.get("percentage") or 0
-        kb_charging = kb_bat.get("charging", False)
+        self.kb_driver.reload_config_if_changed()
+        self.kb_winlock.handler_block(self._winlock_handler)
+        self.kb_winlock.set_active(self.kb_driver.config.get("options", {}).get("win_lock", False))
+        self.kb_winlock.handler_unblock(self._winlock_handler)
 
-        if self.last_kb_connected is not None and self.last_kb_connected != kb_connected:
-            if kb_connected:
-                mode_str = "sans-fil 2.4GHz" if self.kb_driver.is_wireless() else "filaire USB"
-                self._notify("Clavier connecté", f"SkillKorp K20 détecté en mode {mode_str}.")
-            else:
-                self._notify("Clavier déconnecté", "SkillKorp K20 n'est plus détecté.")
-        self.last_kb_connected = kb_connected
-
-        if kb_connected and kb_pct > 0:
-            if kb_pct <= 10 and not self.kb_warned_low_10 and not kb_charging:
-                self._notify("Batterie Critique (Clavier)", f"SkillKorp K20 : {kb_pct}% restant.", 2)
-                self.kb_warned_low_10 = True
-            elif kb_pct <= 20 and not self.kb_warned_low_20 and not kb_charging:
-                self._notify("Batterie Faible (Clavier)", f"SkillKorp K20 : {kb_pct}% restant.", 1)
-                self.kb_warned_low_20 = True
-            elif kb_pct > 30:
-                self.kb_warned_low_20 = False
-                self.kb_warned_low_10 = False
-
-        kb_str = f"⌨{kb_pct}%" if kb_connected else "⌨--"
-        self.item_kb_battery.set_label(f"⌨ Clavier : {kb_pct}%" + (" (charge)" if kb_charging else "") if kb_connected else "⌨ Clavier déconnecté")
-
-        mouse_connected = self.mouse_driver.is_connected()
-        mouse_bat = self.mouse_driver.get_battery()
-        mouse_pct = mouse_bat.get("percentage") or 0
-        mouse_charging = mouse_bat.get("charging", False)
-
-        if self.last_mouse_connected is not None and self.last_mouse_connected != mouse_connected:
-            if mouse_connected:
-                self._notify("Souris connectée", "SkillKorp M20 détectée.")
-            else:
-                self._notify("Souris déconnectée", "SkillKorp M20 n'est plus détectée.")
-        self.last_mouse_connected = mouse_connected
-
-        if mouse_connected and mouse_pct > 0:
-            if mouse_pct <= 10 and not self.mouse_warned_low_10 and not mouse_charging:
-                self._notify("Batterie Critique (Souris)", f"SkillKorp M20 : {mouse_pct}% restant.", 2)
-                self.mouse_warned_low_10 = True
-            elif mouse_pct <= 20 and not self.mouse_warned_low_20 and not mouse_charging:
-                self._notify("Batterie Faible (Souris)", f"SkillKorp M20 : {mouse_pct}% restant.", 1)
-                self.mouse_warned_low_20 = True
-            elif mouse_pct > 30:
-                self.mouse_warned_low_20 = False
-                self.mouse_warned_low_10 = False
-
-        mouse_str = f"🖱{mouse_pct}%" if mouse_connected else "🖱--"
-        self.item_mouse_battery.set_label(f"🖱 Souris : {mouse_pct}%" + (" (charge)" if mouse_charging else "") if mouse_connected else "🖱 Souris déconnectée")
-
-        self.indicator.set_label(f"{kb_str} {mouse_str}", "⌨100% 🖱100%")
-
-        kb_active_id = self.kb_pm.get_active_profile_id()
-        kb_prof = self.kb_pm.get_profile(kb_active_id)
-        self.kb_profile_item.set_label(f"Profil : {kb_prof.get('name', kb_active_id) if kb_prof else kb_active_id}")
-
-        mouse_active_id = self.mouse_pm.get_active_profile_id()
-        mouse_prof = self.mouse_pm.get_profile(mouse_active_id)
-        self.mouse_profile_item.set_label(f"Profil : {mouse_prof.get('name', mouse_active_id) if mouse_prof else mouse_active_id}")
-
-        opts = self.kb_driver.config.get("options", {})
-        self.kb_win_lock_item.set_active(opts.get("win_lock", False))
-
-        self._populate_dpi_submenu()
-
-    def _on_status_timer(self) -> bool:
-        self._update_status()
-        return True
-
-    def _on_auto_switch_timer(self) -> bool:
-        cls = detect_active_window_class()
-        if cls and cls != self.last_active_window:
-            self.last_active_window = cls
-
-            if self.kb_pm.is_auto_switch_enabled():
-                matched = find_matching_profile(self.kb_pm.list_profiles(), cls)
-                if matched and matched != self.kb_pm.get_active_profile_id():
-                    p = self.kb_pm.switch_profile(matched, driver=self.kb_driver)
-                    self._notify("Profil clavier automatique", f"Profil '{p.get('name', matched)}' pour {cls}.")
-                    self._populate_profile_submenu(self.kb_profile_submenu, self.kb_pm, self._on_select_kb_profile)
-
-            if self.mouse_pm.is_auto_switch_enabled():
-                matched = find_matching_profile(self.mouse_pm.list_profiles(), cls)
-                if matched and matched != self.mouse_pm.get_active_profile_id():
-                    p = self.mouse_pm.switch_profile(matched, driver=self.mouse_driver)
-                    self._notify("Profil souris automatique", f"Profil '{p.get('name', matched)}' pour {cls}.")
-                    self._populate_profile_submenu(self.mouse_profile_submenu, self.mouse_pm, self._on_select_mouse_profile)
-
-            self._update_status()
-
-        return True
-
-    # -------------------------------------------------------------------
-    # Callbacks
-    # -------------------------------------------------------------------
-    def _on_select_kb_profile(self, prof_id: str):
-        try:
-            prof = self.kb_pm.switch_profile(prof_id, driver=self.kb_driver)
-            self._populate_profile_submenu(self.kb_profile_submenu, self.kb_pm, self._on_select_kb_profile)
-            self._update_status()
-            self._notify("Profil clavier activé", f"Profil '{prof.get('name', prof_id)}' appliqué.")
-        except Exception as e:
-            print(f"Erreur sélection profil clavier : {e}", file=sys.stderr)
-
-    def _on_select_mouse_profile(self, prof_id: str):
-        try:
-            prof = self.mouse_pm.switch_profile(prof_id, driver=self.mouse_driver)
-            self._populate_profile_submenu(self.mouse_profile_submenu, self.mouse_pm, self._on_select_mouse_profile)
-            self._update_status()
-            self._notify("Profil souris activé", f"Profil '{prof.get('name', prof_id)}' appliqué.")
-        except Exception as e:
-            print(f"Erreur sélection profil souris : {e}", file=sys.stderr)
-
-    def _on_select_kb_rgb(self, mode: str):
-        self.kb_driver.set_rgb(mode=mode)
-        self._notify("Éclairage RGB (Clavier)", f"Effet '{mode}' appliqué.")
-
-    def _on_select_kb_poll(self, rate: int):
-        self.kb_driver.set_polling_rate(rate)
-        self._notify("Taux de rafraîchissement (Clavier)", f"Configuré à {rate} Hz.")
-
-    def _on_toggle_kb_win_lock(self, item):
+    def _on_toggle_winlock(self, item):
         target = item.get_active()
-        self.kb_driver.set_keyboard_options(win_lock=target)
-        st = "verrouillée" if target else "déverrouillée"
-        self._notify("Touche Windows", f"Touche Windows {st}.")
+        self._run("keyboard", lambda: self.kb_driver.set_keyboard_options(win_lock=target),
+                  f"Touche Windows {'verrouillée' if target else 'déverrouillée'}")
 
-    def _on_select_mouse_rate(self, rate: int):
-        self.mouse_driver.set_polling_rate(rate)
-        self._notify("Taux de rapport (Souris)", f"Configuré à {rate} Hz.")
+    def _on_toggle_autoswitch(self, item):
+        for pm in (self.kb_pm, self.mouse_pm):
+            pm.set_auto_switch_enabled(item.get_active())
 
-    def _on_select_mouse_dpi_stage(self, stage_num: int):
+    def _quit_all(self):
+        """Quit the tray and the SkillKorp Suite window if it is open."""
         try:
-            self.mouse_driver.set_dpi_and_sensor(active_stage=stage_num)
-            stages = self.mouse_driver.config.get("dpi_stages", [])
-            dpi_val = stages[stage_num - 1] if 1 <= stage_num <= len(stages) else "?"
-            self._notify("Sensibilité DPI", f"Étape {stage_num} : {dpi_val} DPI")
-        except Exception as e:
-            print(f"Erreur changement DPI : {e}", file=sys.stderr)
-
-    def _on_toggle_autostart(self, item):
-        set_autostart(item.get_active())
-
-    def _on_open_gui(self, item):
-        try:
-            subprocess.Popen(["skillkorp-gui"])
-        except Exception:
-            gui_module = os.path.join(BASE_DIR, "skillkorp", "gui.py")
-            subprocess.Popen([sys.executable, gui_module])
-
-    def _on_quit(self, item):
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            bus.call_sync(GUI_APP_ID, GUI_OBJECT_PATH, "org.gtk.Actions", "Activate",
+                          GLib.Variant("(sava{sv})", ("quit", [], {})), None,
+                          Gio.DBusCallFlags.NO_AUTO_START, 2000, None)
+        except GLib.Error:
+            pass  # the window is not open
         Gtk.main_quit()
 
+    def _open_gui(self):
+        try:
+            subprocess.Popen(["skillkorp-gui"], start_new_session=True)
+        except OSError:
+            code = f"import sys; sys.path.insert(0, {BASE_DIR!r}); from skillkorp.gui import main; sys.exit(main())"
+            subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
 
-def _write_pid():
-    os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
+    # ------------------------------------------------------------- status
+    def _on_status_timer(self) -> bool:
+        self._ticks += 1
+        self._poll()
+        return True
+
+    def _poll(self, force_battery: bool = False):
+        battery = force_battery or (self._ticks * STATUS_PERIOD_S) % BATTERY_PERIOD_S == 0
+
+        def kb_task():
+            connected = self.kb_driver.is_connected()
+            state = {"connected": connected}
+            if connected:
+                state["wireless"] = self.kb_driver.is_wireless()
+                if battery:
+                    state["battery"] = self.kb_driver.get_battery()
+                if self.kb_driver.pending_settings():
+                    state["synced"] = self.kb_driver.sync_pending()
+            return state
+
+        def mouse_task():
+            connected = self.mouse_driver.is_connected()
+            state = {"connected": connected}
+            if connected:
+                state["wireless"] = self.mouse_driver.is_wireless()
+                state["battery"] = self.mouse_driver.get_battery(poll_hardware=battery)
+            return state
+
+        self.kb_worker.submit(kb_task, lambda s: self._on_state("keyboard", s), lambda e: None, key="status")
+        self.mouse_worker.submit(mouse_task, lambda s: self._on_state("mouse", s), lambda e: None, key="status")
+
+    def _on_state(self, device: str, state: Dict[str, Any]):
+        prev = self.state[device]
+        if "battery" not in state and "battery" in prev and state.get("connected"):
+            state["battery"] = prev["battery"]
+        self.state[device] = state
+        label = "Clavier" if device == "keyboard" else "Souris"
+        name = "SkillKorp K20" if device == "keyboard" else "SkillKorp M20"
+        if state.get("synced"):
+            self._notify(label, "Clavier réveillé : réglages en attente appliqués.")
+
+        if prev and prev.get("connected") != state.get("connected"):
+            if state.get("connected"):
+                mode = "sans-fil 2.4 GHz" if state.get("wireless") else "filaire USB"
+                self._notify(f"{label} connecté(e)", f"{name} détecté(e) en mode {mode}.")
+            else:
+                self._notify(f"{label} déconnecté(e)", f"{name} n'est plus détecté(e).")
+
+        bat = state.get("battery") or {}
+        pct = bat.get("percentage")
+        if state.get("connected") and pct is not None and not bat.get("charging"):
+            for threshold, urgency in ((10, 2), (20, 1)):
+                if pct <= threshold < self.warned[device]:
+                    self._notify(f"Batterie {'critique' if threshold == 10 else 'faible'} ({label})",
+                                 f"{name} : {pct}% restant.", urgency)
+                    self.warned[device] = threshold
+                    break
+        if pct is not None and (pct > 30 or bat.get("charging")):
+            self.warned[device] = 100
+
+        item = self.item_kb_battery if device == "keyboard" else self.item_mouse_battery
+        if not state.get("connected"):
+            item.set_label(f"{label} : déconnecté(e)")
+        else:
+            item.set_label(f"{label} : {bat.get('status_str', '…')}")
+        self._update_label()
+
+    def _update_label(self):
+        # The panel shows the logo alone; the levels stay in the menu.
+        parts = []
+        for device, name in (("keyboard", "clavier"), ("mouse", "souris")):
+            st = self.state[device]
+            pct = (st.get("battery") or {}).get("percentage")
+            parts.append(f"{name} {pct} %" if st.get("connected") and pct is not None else f"{name} --")
+        self.indicator.set_title("SkillKorp Suite — " + ", ".join(parts))
+
+    # ---------------------------------------------------------- auto switch
+    def _on_auto_switch_timer(self) -> bool:
+        if self._switch_busy:
+            return True
+        self._switch_busy = True
+
+        def done(switched):
+            self._switch_busy = False
+            if switched:
+                self._refresh_menus()
+
+        def failed(exc):
+            self._switch_busy = False
+            print(f"[tray] bascule automatique : {exc}", file=sys.stderr)
+        # Window detection spawns helper processes: keep it off the main loop.
+        self.switch_worker.submit(self.switcher.tick, done, failed, key="autoswitch")
+        return True
+
+    def _on_auto_switched(self, device, pid, prof, ok, window_class):
+        label = "clavier" if device == "keyboard" else "souris"
+        msg = f"Profil {label} « {prof.get('name', pid)} » ({window_class})"
+        GLib.idle_add(lambda: (self._notify("Bascule automatique", msg if ok else msg + " — échec partiel"), False)[1])
+
+    def shutdown(self):
+        for worker in (self.kb_worker, self.mouse_worker, self.switch_worker):
+            worker.stop()
 
 
-def _remove_pid():
+def _acquire_single_instance():
+    path = pid_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
     try:
-        os.remove(PID_FILE)
-    except OSError:
-        pass
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    return fd
 
 
-def main():
-    migrate_legacy_configs()
-    _write_pid()
+def main() -> int:
+    if appindicator is None:
+        print("Erreur : AppIndicator introuvable. Installez libayatana-appindicator (GTK3) "
+              "et son introspection (gir1.2-ayatanaappindicator3-0.1 / typelib).", file=sys.stderr)
+        return 1
+    lock_fd = _acquire_single_instance()
+    if lock_fd is None:
+        print("L'indicateur SkillKorp est déjà en cours d'exécution.", file=sys.stderr)
+        return 0
     try:
-        app = SkillkorpSuiteTray()
+        migrate_legacy_configs()
+    except Exception as e:
+        print(f"[tray] migration impossible : {e}", file=sys.stderr)
+    tray = None
+    try:
+        tray = SkillkorpSuiteTray()
+        try:
+            gi.require_version("GLibUnix", "2.0")
+            from gi.repository import GLibUnix
+            add_signal = GLibUnix.signal_add
+        except (ValueError, ImportError):
+            add_signal = GLib.unix_signal_add
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            add_signal(GLib.PRIORITY_DEFAULT, sig, lambda *a: (Gtk.main_quit(), False)[1])
         Gtk.main()
+    except DeviceError as e:
+        print(f"[tray] {e}", file=sys.stderr)
+        return 1
     finally:
-        _remove_pid()
+        if tray:
+            tray.shutdown()
+        try:
+            os.remove(pid_file())
+        except OSError:
+            pass
+        os.close(lock_fd)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

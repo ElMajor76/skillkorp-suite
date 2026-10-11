@@ -8,25 +8,27 @@ type keeps its own profile schema and storage location (a keyboard profile
 and a mouse profile are never interchangeable), but both are handled by
 this single ProfileManager class parameterized by `device_type`.
 
-Storage layout (unified, replacing the separate ~/.config/skillkorp-k20 and
-~/.config/skillkorp-m20 directories from the standalone projects):
+Storage layout:
     ~/.config/skillkorp/keyboard/profiles/*.json
     ~/.config/skillkorp/keyboard/profile_state.json
     ~/.config/skillkorp/mouse/profiles/*.json
     ~/.config/skillkorp/mouse/profile_state.json
 
-A daemon or tray process that wants "switch both devices when the same
-application matches both" simply drives two ProfileManager instances (one
-per device_type) against the same detected window class each tick - see
-skillkorp/cli.py's `daemon` command and skillkorp/tray.py.
+All writes are atomic and every profile is validated (on import, on save and
+before being applied), so a hand-edited or truncated file can never push
+garbage to the hardware. `AutoSwitcher` implements the per-application
+switching shared by `skillkorpctl daemon` and the tray.
 """
 
-import os
-import sys
+import copy
 import json
+import os
 import re
 import subprocess
-from typing import Any, Dict, List, Optional
+import sys
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from skillkorp import config_store
 
 CONFIG_DIR = os.path.expanduser("~/.config/skillkorp")
 
@@ -34,31 +36,68 @@ AUTOSTART_DIR = os.path.expanduser("~/.config/autostart")
 AUTOSTART_FILE = os.path.join(AUTOSTART_DIR, "io.github.skillkorp.suite.tray.desktop")
 
 VALID_DEVICE_TYPES = ("keyboard", "mouse")
+PROFILE_ID_RE = re.compile(r"[^a-z0-9_\-]")
 
 
-def is_autostart_enabled() -> bool:
-    return os.path.exists(AUTOSTART_FILE)
-
-
-def set_autostart(enabled: bool):
-    os.makedirs(AUTOSTART_DIR, exist_ok=True)
-    if enabled:
-        content = """[Desktop Entry]
+AUTOSTART_ENTRY = """[Desktop Entry]
 Type=Application
 Name=SkillKorp Suite Tray
 Comment=Indicateur de batterie et raccourcis SkillKorp (clavier K20 & souris M20)
-Exec=skillkorpctl tray start --foreground
+Exec=skillkorp-tray
 Icon=skillkorp-suite
 Terminal=false
 Categories=Utility;
 StartupNotify=false
 X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
 """
-        with open(AUTOSTART_FILE, "w", encoding="utf-8") as f:
-            f.write(content)
+
+
+def system_autostart_files() -> List[str]:
+    """Autostart entries installed by the packages (/etc/xdg/autostart)."""
+    dirs = os.environ.get("XDG_CONFIG_DIRS") or "/etc/xdg"
+    name = os.path.basename(AUTOSTART_FILE)
+    return [os.path.join(d, "autostart", name) for d in dirs.split(":") if d]
+
+
+def _entry_enabled(path: str) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = [line.strip().lower() for line in f]
+    except OSError:
+        return False
+    return "hidden=true" not in lines and "x-gnome-autostart-enabled=false" not in lines
+
+
+def is_autostart_enabled() -> bool:
+    # A user entry (same file name) overrides the system one, as in the XDG spec.
+    if os.path.exists(AUTOSTART_FILE):
+        return _entry_enabled(AUTOSTART_FILE)
+    return any(_entry_enabled(p) for p in system_autostart_files())
+
+
+def set_autostart(enabled: bool):
+    system = any(os.path.exists(p) for p in system_autostart_files())
+    if enabled:
+        content = AUTOSTART_ENTRY
+    elif system:
+        content = AUTOSTART_ENTRY + "Hidden=true\n"  # masks the packaged entry
     else:
         if os.path.exists(AUTOSTART_FILE):
             os.remove(AUTOSTART_FILE)
+        return
+    os.makedirs(AUTOSTART_DIR, exist_ok=True)
+    tmp = AUTOSTART_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, AUTOSTART_FILE)
+
+
+def sanitize_profile_id(prof_id: str) -> str:
+    safe = PROFILE_ID_RE.sub("_", str(prof_id).strip().lower())
+    if not safe or safe.strip("_-") == "":
+        raise ValueError(f"Identifiant de profil invalide: {prof_id!r}")
+    return safe[:64]
 
 
 # Default profiles created on initial setup, per device type.
@@ -86,6 +125,7 @@ DEFAULT_PROFILES_KEYBOARD: Dict[str, Dict[str, Any]] = {
             "brightness": 4,
             "direction": 0,
             "color": "#FF0000",
+            "colorful": True,
         },
         "side_rgb": {
             "mode": "rainbow",
@@ -120,6 +160,7 @@ DEFAULT_PROFILES_KEYBOARD: Dict[str, Dict[str, Any]] = {
             "brightness": 4,
             "direction": 0,
             "color": "#FF0055",
+            "colorful": True,
         },
         "side_rgb": {
             "mode": "rainbow",
@@ -173,7 +214,7 @@ DEFAULT_PROFILES_KEYBOARD: Dict[str, Dict[str, Any]] = {
         "polling_rate": 125,
         "debounce_ms": 12,
         "sleep": {
-            "light_sleep_sec": 30,
+            "light_sleep_sec": 60,
             "deep_sleep_sec": 600,
         },
         "options": {
@@ -215,11 +256,11 @@ DEFAULT_PROFILES_MOUSE: Dict[str, Dict[str, Any]] = {
         "motion_sync": True,
         "angle_snap": False,
         "ripple": False,
-        "sleep_timer_minutes": 5,
-        "move_to_wake": True,
+        "sleep_timer_minutes": 10,
+        "led_off_minutes": 1,
         "light_mode": "static",
         "brightness": 8,
-        "speed": 4,
+        "speed": 6,
         "light_color": [255, 0, 0],
         "buttons": {
             "1": "left_click",
@@ -245,10 +286,10 @@ DEFAULT_PROFILES_MOUSE: Dict[str, Dict[str, Any]] = {
         "angle_snap": False,
         "ripple": False,
         "sleep_timer_minutes": 10,
-        "move_to_wake": True,
+        "led_off_minutes": 1,
         "light_mode": "breathing",
         "brightness": 6,
-        "speed": 4,
+        "speed": 6,
         "light_color": [255, 64, 0],
         "buttons": {
             "1": "left_click",
@@ -284,10 +325,10 @@ DEFAULT_PROFILES_MOUSE: Dict[str, Dict[str, Any]] = {
         "angle_snap": False,
         "ripple": False,
         "sleep_timer_minutes": 3,
-        "move_to_wake": False,
+        "led_off_minutes": 1,
         "light_mode": "static",
         "brightness": 2,
-        "speed": 4,
+        "speed": 6,
         "light_color": [0, 120, 255],
         "buttons": {
             "1": "left_click",
@@ -311,15 +352,165 @@ DEFAULT_PROFILES_MOUSE: Dict[str, Dict[str, Any]] = {
     },
 }
 
+
+
 _DEFAULT_PROFILES_BY_TYPE = {
     "keyboard": DEFAULT_PROFILES_KEYBOARD,
     "mouse": DEFAULT_PROFILES_MOUSE,
 }
 
+VALID_RATES = (125, 250, 500, 1000)
+
+
+def _check_int(data: Dict[str, Any], key: str, lo: int, hi: int, errors: List[str], label: Optional[str] = None):
+    if key not in data or data[key] is None:
+        return
+    v = data[key]
+    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+        errors.append(f"{label or key} invalide: {v!r} (attendu {lo}..{hi})")
+
+
+def _check_bool(data: Dict[str, Any], key: str, errors: List[str]):
+    if key in data and data[key] is not None and not isinstance(data[key], bool):
+        errors.append(f"{key} doit valoir true ou false (reçu {data[key]!r})")
+
+
+def _check_color(value, label: str, errors: List[str]):
+    if value is None:
+        return
+    if isinstance(value, str):
+        if not re.fullmatch(r"#?[0-9A-Fa-f]{6}", value.strip()):
+            errors.append(f"{label}: couleur invalide {value!r}")
+    elif isinstance(value, (list, tuple)):
+        if len(value) != 3 or not all(isinstance(c, int) and not isinstance(c, bool) and 0 <= c <= 255 for c in value):
+            errors.append(f"{label}: couleur invalide {value!r}")
+    else:
+        errors.append(f"{label}: couleur invalide {value!r}")
+
+
+def validate_profile(device_type: str, data: Any) -> List[str]:
+    """Return a list of human readable problems (empty if the profile is valid)."""
+    errors: List[str] = []
+    if not isinstance(data, dict):
+        return ["Le profil doit être un objet JSON."]
+    if data.get("device_type") not in (None, device_type):
+        errors.append(f"Ce profil est destiné au périphérique '{data.get('device_type')}', pas '{device_type}'.")
+    if "polling_rate" in data and data["polling_rate"] not in VALID_RATES:
+        errors.append(f"polling_rate invalide: {data['polling_rate']!r}. Valeurs acceptées: {list(VALID_RATES)}.")
+    apps = data.get("auto_switch_apps", [])
+    if not isinstance(apps, list) or not all(isinstance(a, str) for a in apps):
+        errors.append("auto_switch_apps doit être une liste de chaînes.")
+
+    if device_type == "keyboard":
+        from skillkorp.devices import keyboard as kb
+        _check_int(data, "debounce_ms", kb.DEBOUNCE_RANGE[0], kb.DEBOUNCE_RANGE[1], errors)
+        sleep = data.get("sleep")
+        if sleep is not None:
+            if not isinstance(sleep, dict):
+                errors.append("sleep doit être un objet.")
+            else:
+                _check_int(sleep, "light_sleep_sec", 0, 86400, errors)
+                _check_int(sleep, "deep_sleep_sec", 0, 86400, errors)
+        opts = data.get("options")
+        if opts is not None:
+            if not isinstance(opts, dict):
+                errors.append("options doit être un objet.")
+            else:
+                for key in ("win_lock", "wasd_swap", "gaming_mode"):
+                    _check_bool(opts, key, errors)
+                if opts.get("os_mode") not in (None,) + kb.OS_MODES:
+                    errors.append(f"os_mode invalide: {opts.get('os_mode')!r} (win ou mac).")
+        for section, table in (("rgb", kb.LIGHT_CODE_BY_KEY), ("side_rgb", kb.SIDE_LIGHT_CODE_BY_KEY)):
+            led = data.get(section)
+            if led is None:
+                continue
+            if not isinstance(led, dict):
+                errors.append(f"{section} doit être un objet.")
+                continue
+            if led.get("mode") is not None and led.get("mode") not in table:
+                errors.append(f"{section}.mode invalide: {led.get('mode')!r}.")
+            _check_int(led, "speed", 1, 5, errors, f"{section}.speed")
+            _check_int(led, "brightness", 0, 4, errors, f"{section}.brightness")
+            _check_int(led, "direction", 0, 3, errors, f"{section}.direction")
+            _check_bool(led, "colorful", errors)
+            _check_color(led.get("color"), f"{section}.color", errors)
+        for section in ("key_remaps", "fn_remaps"):
+            remaps = data.get(section)
+            if remaps is None:
+                continue
+            if not isinstance(remaps, dict):
+                errors.append(f"{section} doit être un objet.")
+                continue
+            for key_name, action in remaps.items():
+                if key_name not in kb.KEY_MATRIX_INDEX:
+                    errors.append(f"{section}: touche inconnue {key_name!r}.")
+                if action not in kb.REMAP_ACTIONS:
+                    errors.append(f"{section}: action inconnue {action!r} pour {key_name}.")
+    else:
+        from skillkorp.devices import mouse as ms
+        stages = data.get("dpi_stages")
+        if stages is not None:
+            if not isinstance(stages, list) or not 1 <= len(stages) <= ms.MAX_STAGES:
+                errors.append(f"dpi_stages doit être une liste de 1 à {ms.MAX_STAGES} valeurs.")
+            else:
+                for s in stages:
+                    if isinstance(s, bool) or not isinstance(s, int) or not ms.DPI_RANGE[0] <= s <= ms.DPI_RANGE[1]:
+                        errors.append(f"DPI invalide: {s!r} (plage: {ms.DPI_RANGE[0]}–{ms.DPI_RANGE[1]}).")
+        n_stages = len(stages) if isinstance(stages, list) and stages else 6
+        _check_int(data, "active_stage", 1, n_stages, errors)
+        _check_int(data, "lod", 1, 2, errors)
+        _check_int(data, "debounce", ms.DEBOUNCE_RANGE[0], ms.DEBOUNCE_RANGE[1], errors)
+        _check_int(data, "brightness", ms.BRIGHTNESS_RANGE[0], ms.BRIGHTNESS_RANGE[1], errors)
+        _check_int(data, "speed", 1, ms.SPEED_RANGE[1], errors)
+        _check_int(data, "sleep_timer_minutes", ms.SLEEP_RANGE[0], ms.SLEEP_RANGE[1], errors)
+        _check_int(data, "led_off_minutes", ms.LED_OFF_RANGE[0], ms.LED_OFF_RANGE[1], errors)
+        for key in ("motion_sync", "angle_snap", "ripple"):
+            _check_bool(data, key, errors)
+        if data.get("light_mode") is not None and data.get("light_mode") not in ms.LIGHT_CODE_BY_KEY:
+            errors.append(f"light_mode invalide: {data.get('light_mode')!r}.")
+        _check_color(data.get("light_color"), "light_color", errors)
+        buttons = data.get("buttons", {})
+        if not isinstance(buttons, dict):
+            errors.append("'buttons' doit être un objet JSON.")
+        else:
+            for btn_key, action in buttons.items():
+                try:
+                    btn_num = int(btn_key)
+                except (ValueError, TypeError):
+                    errors.append(f"Clé de bouton invalide: {btn_key!r} (doit être un entier).")
+                    continue
+                if not 1 <= btn_num <= 6:
+                    errors.append(f"Numéro de bouton invalide: {btn_key} (1–6).")
+                if action not in ms.BUTTON_ACTIONS:
+                    errors.append(f"Action invalide pour le bouton {btn_key}: '{action}'.")
+            if buttons and "left_click" not in buttons.values() and len(buttons) >= 6:
+                errors.append("Au moins un bouton doit rester en 'left_click'.")
+    return errors
+
+
+def upgrade_profile(device_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Bring a profile written by an older version up to the current schema."""
+    data = copy.deepcopy(data)
+    if device_type == "mouse":
+        data.pop("move_to_wake", None)
+        data.setdefault("led_off_minutes", 1)
+        if isinstance(data.get("speed"), int) and data["speed"] < 4:
+            data["speed"] = 4
+    else:
+        sleep = data.get("sleep")
+        if isinstance(sleep, dict):
+            for key, lo in (("light_sleep_sec", 60), ("deep_sleep_sec", 600)):
+                v = sleep.get(key)
+                if isinstance(v, int) and 0 < v < lo:
+                    sleep[key] = lo
+        opts = data.get("options")
+        if isinstance(opts, dict) and opts.get("os_mode") in ("ios", "android"):
+            opts["os_mode"] = "win"
+    return data
+
 
 class ProfileManager:
-    """Manages multi-profile storage, active profile state, and hardware
-    synchronization for a single device type ("keyboard" or "mouse")."""
+    """Multi-profile storage, active profile state and hardware sync for one device type."""
 
     def __init__(self, device_type: str, profiles_dir: Optional[str] = None, state_file: Optional[str] = None):
         if device_type not in VALID_DEVICE_TYPES:
@@ -329,15 +520,16 @@ class ProfileManager:
         self.profiles_dir = profiles_dir or os.path.join(device_dir, "profiles")
         self.state_file = state_file or os.path.join(device_dir, "profile_state.json")
         self._default_profiles = _DEFAULT_PROFILES_BY_TYPE[device_type]
+        self.last_apply_ok: Optional[bool] = None
         self._ensure_init()
 
+    # -- storage ------------------------------------------------------------
     def _ensure_init(self):
         os.makedirs(self.profiles_dir, exist_ok=True)
         for prof_id, prof_data in self._default_profiles.items():
             path = self._get_profile_path(prof_id)
             if not os.path.exists(path):
-                self._save_profile_file(path, prof_data)
-
+                config_store.save_json_atomic(path, prof_data)
         if not os.path.exists(self.state_file):
             self._save_state({"active_profile": "default", "auto_switch_enabled": True})
 
@@ -345,48 +537,39 @@ class ProfileManager:
         safe_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", prof_id)
         return os.path.join(self.profiles_dir, f"{safe_id}.json")
 
-    def _save_profile_file(self, path: str, data: Dict[str, Any]):
-        tmp_path = path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, path)
-
     def _load_state(self) -> Dict[str, Any]:
-        if os.path.exists(self.state_file):
-            try:
-                with open(self.state_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"[profile_manager:{self.device_type}] Erreur lecture état: {e}", file=sys.stderr)
-        return {"active_profile": "default", "auto_switch_enabled": True}
+        return config_store.load_json(self.state_file,
+                                      lambda: {"active_profile": "default", "auto_switch_enabled": True})
 
     def _save_state(self, state: Dict[str, Any]):
-        tmp_path = self.state_file + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, self.state_file)
+        config_store.save_json_atomic(self.state_file, state)
 
+    def _update_state(self, mutator: Callable[[Dict[str, Any]], None]):
+        with config_store.locked(self.state_file):
+            st = self._load_state()
+            mutator(st)
+            self._save_state(st)
+
+    # -- state ----------------------------------------------------------------
     def is_auto_switch_enabled(self) -> bool:
         return bool(self._load_state().get("auto_switch_enabled", True))
 
     def set_auto_switch_enabled(self, enabled: bool):
-        st = self._load_state()
-        st["auto_switch_enabled"] = bool(enabled)
-        self._save_state(st)
+        self._update_state(lambda st: st.__setitem__("auto_switch_enabled", bool(enabled)))
 
     def get_active_profile_id(self) -> str:
-        state = self._load_state()
-        active_id = state.get("active_profile", "default")
-        if not os.path.exists(self._get_profile_path(active_id)):
+        active_id = self._load_state().get("active_profile", "default")
+        if not isinstance(active_id, str) or not os.path.exists(self._get_profile_path(active_id)):
             return "default"
         return active_id
 
+    # -- CRUD -----------------------------------------------------------------
     def list_profiles(self) -> List[Dict[str, Any]]:
         active_id = self.get_active_profile_id()
         profiles = []
-        if os.path.exists(self.profiles_dir):
+        if os.path.isdir(self.profiles_dir):
             for fname in sorted(os.listdir(self.profiles_dir)):
-                if fname.endswith(".json"):
+                if fname.endswith(".json") and not fname.startswith("."):
                     prof_id = fname[:-5]
                     prof = self.get_profile(prof_id)
                     if prof:
@@ -398,193 +581,175 @@ class ProfileManager:
         path = self._get_profile_path(prof_id)
         if not os.path.exists(path):
             return None
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                data["id"] = prof_id
-                data.setdefault("device_type", self.device_type)
-                return data
-        except Exception as e:
-            print(f"[ProfileManager:{self.device_type}] Erreur chargement {path}: {e}", file=sys.stderr)
-            return None
+        data = config_store.load_json(path, lambda: None)
+        if not isinstance(data, dict):
+            if prof_id in self._default_profiles:  # self-heal a broken built-in profile
+                data = copy.deepcopy(self._default_profiles[prof_id])
+                config_store.save_json_atomic(path, data)
+            else:
+                return None
+        data = upgrade_profile(self.device_type, data)
+        data["id"] = prof_id
+        data.setdefault("device_type", self.device_type)
+        data.setdefault("name", prof_id)
+        if not isinstance(data.get("auto_switch_apps"), list):
+            data["auto_switch_apps"] = []
+        return data
 
     def save_profile(self, prof_id: str, data: Dict[str, Any]):
-        path = self._get_profile_path(prof_id)
+        data = dict(data)
+        data.pop("active", None)
         data["id"] = prof_id
         data["device_type"] = self.device_type
-        self._save_profile_file(path, data)
+        errors = validate_profile(self.device_type, data)
+        if errors:
+            raise ValueError("Profil invalide: " + "; ".join(errors))
+        config_store.save_json_atomic(self._get_profile_path(prof_id), data)
 
     def create_profile(self, prof_id: str, name: str, copy_from: Optional[str] = None) -> Dict[str, Any]:
-        safe_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", prof_id).lower()
-        if copy_from:
-            source = self.get_profile(copy_from)
-        else:
-            source = self.get_profile("default")
-
+        safe_id = sanitize_profile_id(prof_id)
+        if os.path.exists(self._get_profile_path(safe_id)):
+            raise ValueError(f"Le profil '{safe_id}' existe déjà.")
+        source = self.get_profile(copy_from) if copy_from else self.get_profile("default")
+        if copy_from and not source:
+            raise ValueError(f"Profil source '{copy_from}' introuvable.")
         if not source:
-            source = self._default_profiles["default"].copy()
-
+            source = copy.deepcopy(self._default_profiles["default"])
         new_data = json.loads(json.dumps(source))
+        new_data.pop("active", None)
         new_data["id"] = safe_id
-        new_data["name"] = name
-        new_data["description"] = f"Profil personnalisé : {name}"
+        new_data["name"] = name or safe_id
+        new_data["description"] = f"Profil personnalisé : {name or safe_id}"
         new_data["auto_switch_apps"] = []
         self.save_profile(safe_id, new_data)
         return new_data
 
-    def delete_profile(self, prof_id: str) -> bool:
+    def delete_profile(self, prof_id: str, driver: Optional[Any] = None) -> bool:
         if prof_id == "default":
             raise ValueError("Le profil 'default' ne peut pas être supprimé.")
         path = self._get_profile_path(prof_id)
-        if os.path.exists(path):
-            os.remove(path)
-            if self.get_active_profile_id() == prof_id:
-                self.switch_profile("default")
-            return True
-        return False
+        if not os.path.exists(path):
+            return False
+        was_active = self.get_active_profile_id() == prof_id
+        os.remove(path)
+        if was_active:
+            self.switch_profile("default", driver=driver)
+        return True
 
     def export_profile(self, prof_id: str, target_file: str) -> bool:
         prof = self.get_profile(prof_id)
         if not prof:
             raise ValueError(f"Profil '{prof_id}' introuvable.")
-        with open(target_file, "w", encoding="utf-8") as f:
-            json.dump(prof, f, indent=2, ensure_ascii=False)
+        prof.pop("active", None)
+        config_store.save_json_atomic(os.path.expanduser(target_file), prof)
         return True
 
     def import_profile(self, source_file: str, new_id: Optional[str] = None) -> str:
         """Import a profile from a JSON file, with per-device-type validation."""
-        with open(source_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
+        with open(os.path.expanduser(source_file), "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except ValueError as e:
+                raise ValueError(f"Fichier JSON invalide: {e}") from None
         if not isinstance(data, dict):
             raise ValueError("Le fichier de profil doit être un objet JSON.")
-
-        valid_rates = [125, 250, 500, 1000]
-        rate = data.get("polling_rate")
-        if rate is not None and rate not in valid_rates:
-            raise ValueError(f"polling_rate invalide: {rate}. Valeurs acceptées: {valid_rates}.")
-
-        if self.device_type == "keyboard":
-            debounce = data.get("debounce_ms")
-            if debounce is not None and (not isinstance(debounce, int) or not (2 <= debounce <= 20)):
-                raise ValueError(f"debounce_ms invalide: {debounce} (doit être entre 2 et 20 ms).")
-        else:  # mouse
-            stages = data.get("dpi_stages")
-            if stages is not None:
-                if not isinstance(stages, list) or not (1 <= len(stages) <= 8):
-                    raise ValueError("dpi_stages doit être une liste de 1 à 8 valeurs.")
-                for s in stages:
-                    if not isinstance(s, int) or not (50 <= s <= 26000):
-                        raise ValueError(f"DPI invalide: {s} (plage: 50–26000).")
-
-            active = data.get("active_stage")
-            if active is not None:
-                stages_for_check = stages if stages is not None else [400, 800, 1600, 3200, 6400, 26000]
-                if not isinstance(active, int) or not (1 <= active <= len(stages_for_check)):
-                    raise ValueError(f"active_stage {active} hors limites (1–{len(stages_for_check)}).")
-
-            from skillkorp.devices.mouse import BUTTON_ACTIONS
-            valid_actions = set(BUTTON_ACTIONS.keys())
-            buttons = data.get("buttons", {})
-            if not isinstance(buttons, dict):
-                raise ValueError("'buttons' doit être un objet JSON.")
-            for btn_key, action in buttons.items():
-                try:
-                    btn_num = int(btn_key)
-                    if not (1 <= btn_num <= 6):
-                        raise ValueError(f"Numéro de bouton invalide: {btn_key} (1–6).")
-                except (ValueError, TypeError):
-                    raise ValueError(f"Clé de bouton invalide: {btn_key!r} (doit être un entier).")
-                if action not in valid_actions:
-                    raise ValueError(f"Action invalide pour le bouton {btn_key}: '{action}'.")
-
-        prof_id = new_id or data.get("id") or os.path.basename(source_file).replace(".json", "")
-        safe_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", prof_id).lower()
+        data = upgrade_profile(self.device_type, data)
+        errors = validate_profile(self.device_type, data)
+        if errors:
+            raise ValueError("; ".join(errors))
+        prof_id = new_id or data.get("id") or os.path.splitext(os.path.basename(source_file))[0]
+        safe_id = sanitize_profile_id(prof_id)
         data["id"] = safe_id
+        data.setdefault("name", safe_id)
         self.save_profile(safe_id, data)
         return safe_id
 
+    def set_auto_switch_apps(self, prof_id: str, apps: List[str]):
+        prof = self.get_profile(prof_id)
+        if not prof:
+            raise ValueError(f"Profil '{prof_id}' introuvable.")
+        prof["auto_switch_apps"] = [a.strip().lower() for a in apps if a and a.strip()]
+        self.save_profile(prof_id, prof)
+
+    # -- activation -------------------------------------------------------------
     def switch_profile(self, prof_id: str, driver: Optional[Any] = None) -> Dict[str, Any]:
         prof = self.get_profile(prof_id)
         if not prof:
             raise ValueError(f"Profil '{prof_id}' introuvable.")
-
-        st = self._load_state()
-        st["active_profile"] = prof_id
-        self._save_state(st)
-
+        errors = validate_profile(self.device_type, prof)
+        if errors:
+            raise ValueError(f"Profil '{prof_id}' invalide: " + "; ".join(errors))
+        self._update_state(lambda st: st.__setitem__("active_profile", prof_id))
+        self.last_apply_ok = None
         if driver is not None:
-            self.apply_profile_to_driver(prof, driver)
-
+            self.last_apply_ok = self.apply_profile_to_driver(prof, driver)
         return prof
 
-    def apply_profile_to_driver(self, prof: Dict[str, Any], driver: Any):
-        """Applies profile configuration parameters directly to driver and hardware."""
+    def apply_profile_to_driver(self, prof: Dict[str, Any], driver: Any) -> bool:
+        """Apply a profile to the hardware; returns False if the device refused part of it."""
         if hasattr(driver, "apply_profile"):
-            driver.apply_profile(prof)
+            return bool(driver.apply_profile(prof))
+        return False
+
+
+# =============================================================================
+# Active window detection & auto-switching
+# =============================================================================
+
+def _run(cmd: List[str], timeout: float = 0.4) -> Optional[str]:
+    try:
+        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=timeout).strip()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _detect_gnome() -> Optional[str]:
+    # Works with the "Window Calls"/"Focused Window D-Bus" extensions when present.
+    out = _run(["gdbus", "call", "--session", "--dest", "org.gnome.Shell",
+                "--object-path", "/org/gnome/shell/extensions/FocusedWindow",
+                "--method", "org.gnome.shell.extensions.FocusedWindow.Get"])
+    if out:
+        m = re.search(r'"wm_class"\s*:\s*"([^"]+)"', out.replace("\\", ""))
+        if m:
+            return m.group(1)
+    return None
+
+
+def _detect_kde() -> Optional[str]:
+    out = _run(["kdotool", "getactivewindow", "getwindowclassname"])
+    return out or None
 
 
 def detect_active_window_class() -> Optional[str]:
-    """Detect active window process name or WM_CLASS on Linux (X11 & Wayland)."""
-    # 1. Try xdotool (fastest on X11 / XWayland)
-    try:
-        out = subprocess.check_output(
-            ["xdotool", "getactivewindow", "getwindowclassname"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=0.3,
-        ).strip()
-        if out:
-            return out.lower()
-    except Exception:
-        pass
+    """Detect the focused window's class/app id (X11, XWayland, Hyprland, Sway, KDE, GNOME)."""
+    out = _run(["xdotool", "getactivewindow", "getwindowclassname"], timeout=0.3)
+    if out:
+        return out.lower()
 
-    # 2. Try xprop
-    try:
-        out = subprocess.check_output(
-            ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=0.3,
-        ).strip()
+    out = _run(["xprop", "-root", "_NET_ACTIVE_WINDOW"], timeout=0.3)
+    if out:
         win_id = out.split()[-1]
-        if win_id and win_id != "0x0":
-            prop_out = subprocess.check_output(
-                ["xprop", "-id", win_id, "WM_CLASS"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=0.3,
-            ).strip()
-            matches = re.findall(r'"([^"]+)"', prop_out)
+        if win_id and win_id not in ("0x0", "0x00"):
+            prop_out = _run(["xprop", "-id", win_id, "WM_CLASS"], timeout=0.3)
+            matches = re.findall(r'"([^"]+)"', prop_out or "")
             if matches:
                 return matches[-1].lower()
-    except Exception:
-        pass
 
-    # 3. Try hyprctl (Wayland Hyprland)
-    try:
-        out = subprocess.check_output(
-            ["hyprctl", "activewindow", "-j"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=0.3,
-        )
-        data = json.loads(out)
-        cls = data.get("class")
-        if cls:
-            return cls.lower()
-    except Exception:
-        pass
+    out = _run(["hyprctl", "activewindow", "-j"])
+    if out:
+        try:
+            cls = json.loads(out).get("class")
+            if cls:
+                return cls.lower()
+        except (ValueError, AttributeError):
+            pass
 
-    # 4. Try swaymsg (Wayland Sway)
-    try:
-        out = subprocess.check_output(
-            ["swaymsg", "-t", "get_tree"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=0.4,
-        )
-        data = json.loads(out)
+    out = _run(["swaymsg", "-t", "get_tree"])
+    if out:
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = None
 
         def find_focused(node):
             if node.get("focused"):
@@ -595,19 +760,84 @@ def detect_active_window_class() -> Optional[str]:
                     return res
             return None
 
-        res = find_focused(data)
+        if isinstance(data, dict):
+            res = find_focused(data)
+            if res:
+                return res.lower()
+
+    for detector in (_detect_kde, _detect_gnome):
+        res = detector()
         if res:
             return res.lower()
-    except Exception:
-        pass
-
     return None
 
 
 def find_matching_profile(profiles: List[Dict[str, Any]], window_class: str) -> Optional[str]:
-    """Return the id of the first profile whose auto_switch_apps matches window_class, if any."""
+    """Return the id of the profile whose auto_switch_apps best matches window_class.
+
+    Matching is case-insensitive and substring based (so "steam_app" matches
+    "steam_app_730"); the longest matching pattern wins, which keeps a
+    specific game profile ahead of a generic one. Empty patterns are ignored.
+    """
+    if not window_class:
+        return None
+    window_class = window_class.lower()
+    best: Optional[Tuple[int, str]] = None
     for p in profiles:
-        for app in p.get("auto_switch_apps", []):
-            if app.lower() in window_class:
-                return p["id"]
-    return None
+        for app in p.get("auto_switch_apps", []) or []:
+            pattern = str(app).strip().lower()
+            if pattern and pattern in window_class:
+                if best is None or len(pattern) > best[0]:
+                    best = (len(pattern), p["id"])
+    return best[1] if best else None
+
+
+class AutoSwitcher:
+    """Switch profiles of several devices from the focused application.
+
+    When the focused application matches a profile, that profile is applied;
+    when focus moves to an application that matches nothing, the profile that
+    was active before the automatic switch is restored. A manual change made
+    meanwhile (GUI, CLI, tray) becomes the new baseline.
+    """
+
+    def __init__(self, targets: List[Tuple[ProfileManager, Any]],
+                 detect: Callable[[], Optional[str]] = detect_active_window_class,
+                 on_switch: Optional[Callable[[str, str, Dict[str, Any], bool, str], None]] = None):
+        self.targets = targets
+        self.detect = detect
+        self.on_switch = on_switch
+        self.last_class: Optional[str] = None
+        self._baseline: Dict[str, str] = {}
+        self._auto_active: Dict[str, Optional[str]] = {}
+
+    def tick(self) -> List[Tuple[str, str]]:
+        cls = self.detect()
+        if not cls or cls == self.last_class:
+            return []
+        self.last_class = cls
+        switched: List[Tuple[str, str]] = []
+        for pm, driver in self.targets:
+            dev = pm.device_type
+            if not pm.is_auto_switch_enabled():
+                continue
+            active = pm.get_active_profile_id()
+            if self._auto_active.get(dev) != active:
+                # first run or manual change since our last switch
+                self._baseline[dev] = active
+                self._auto_active[dev] = None
+            matched = find_matching_profile(pm.list_profiles(), cls)
+            target = matched or (self._baseline.get(dev) if self._auto_active.get(dev) else None)
+            if not target or target == active:
+                continue
+            try:
+                prof = pm.switch_profile(target, driver=driver)
+            except ValueError as e:
+                print(f"[auto-switch:{dev}] {e}", file=sys.stderr)
+                continue
+            self._auto_active[dev] = target if matched else None
+            ok = pm.last_apply_ok is not False
+            switched.append((dev, target))
+            if self.on_switch:
+                self.on_switch(dev, target, prof, ok, cls)
+        return switched
