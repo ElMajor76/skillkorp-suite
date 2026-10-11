@@ -141,8 +141,8 @@ DPI/50−1 sur deux tableaux, étape active, couleurs, checksum 16 bits octets
   `modalias` de l'interface USB parente (`usb:v3151p4011*in02`…). Les ACL
   déjà posées sur les autres interfaces sont retirées par les scripts
   d'installation, et `skillkorpctl doctor` signale une interface de saisie
-  encore exposée. Interface 2 vérifiée sur les deux récepteurs ; à confirmer
-  sur les câbles avec `tools/hwtest.py`.
+  encore exposée. Interface 2 vérifiée sur le matériel pour les quatre
+  modes : récepteurs 2.4 GHz et câbles USB du clavier comme de la souris.
 * Lanceurs `PYTHONPATH="/usr/share/…:$PYTHONPATH"` : avec un `PYTHONPATH` vide,
   le `:` final ajoutait le répertoire courant au chemin d'import. Les lanceurs
   utilisent maintenant `python3 -I` (mode isolé).

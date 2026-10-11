@@ -1,6 +1,6 @@
 # Maintainer: nplacide <nplacide95@gmail.com>
 pkgname=skillkorp-suite
-pkgver=1.1.0
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="driver and settings tools for SkillKorp K20 keyboard and M20 mouse"
 arch=('any')
@@ -16,7 +16,7 @@ optdepends=(
 checkdepends=('python')
 backup=('etc/xdg/autostart/io.github.skillkorp.suite.tray.desktop')
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('10640741adabd0cb3869c24b7bd8430f9e2ad526b260b1c3559cfc263a1b9221')
+sha256sums=('2f4162c21e5afe0c87e677b91c0a30176f785eb0f44f9ffd2c22c39410278720')
 
 check() {
     cd "$srcdir/$pkgname-$pkgver"
