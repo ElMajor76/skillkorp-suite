@@ -34,10 +34,10 @@ Validée sur le matériel (K20 en 2.4 GHz et en filaire, M20 par récepteur).
 - Application : icônes du thème système (appareils, niveau de batterie) à la
   place des émojis.
 - Commande `skillkorpctl mouse battery`, pendant de `keyboard battery`.
-- Charge par câble affichée : souris en USB-C « En charge » / « Chargée
-  (100%) » (état d'alimentation du rapport batterie, attendu jusqu'à 2,5 s),
-  clavier en USB « En charge » ; icône de batterie en charge du thème dans
-  l'application.
+- Charge par câble affichée : clavier et souris branchés en USB indiqués
+  « En charge (câble USB) », avec l'icône de batterie en charge du thème ;
+  état d'alimentation de la souris lu dans son rapport batterie (attendu
+  jusqu'à 2,5 s).
 - Souris : chaque écriture est vérifiée par l'accusé du récepteur
   (`03 10 50 00`) et renvoyée une fois si besoin ; réglages d'éclairage,
   absents de la M20 Ultimate, retirés de l'interface.

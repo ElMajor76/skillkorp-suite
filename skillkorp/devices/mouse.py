@@ -576,18 +576,18 @@ class SkillkorpM20Driver(SkillkorpDeviceDriver):
             except DeviceError:
                 pass
         self.reload_config_if_changed()
-        pct = self.config.get("battery")
         wireless = self.is_wireless()
-        # On the cable the mouse is powered (and charged) by USB, whatever the
-        # last report said; on the receiver trust the reported power state.
-        charging = not wireless or bool(self.config.get("charging", False))
+        if not wireless:
+            # On the USB-C cable the mouse charges: shown as such, like the
+            # keyboard, without a level (it sits at 100 % while powered).
+            return {"percentage": None, "charging": True, "connected": True,
+                    "wireless": False, "status_str": "En charge (câble USB)"}
+        pct = self.config.get("battery")
+        charging = bool(self.config.get("charging", False))
         if pct is None:
-            status = "En charge (câble USB-C)" if charging else \
-                "Niveau inconnu (en attente d'un rapport de la souris)"
-        elif charging:
-            status = f"Chargée ({pct}%)" if pct >= 100 else f"En charge ({pct}%)"
+            status = "Niveau inconnu (en attente d'un rapport de la souris)"
         else:
-            status = f"{pct}%"
+            status = f"En charge ({pct}%)" if charging else f"{pct}%"
         return {"percentage": pct, "charging": charging, "connected": True,
                 "wireless": wireless, "status_str": status}
 

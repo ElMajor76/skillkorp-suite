@@ -1085,22 +1085,10 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
                     "wireless": False, "status_str": "Non connecté"}
         wireless = self.is_wireless()
         if not wireless:
-            # Over the cable the keyboard charges; 0x83 answers [0x83, level,
-            # state] but the level reads 0 on the K20 (observed: 83 00 01),
-            # so a percentage is only shown when the firmware gives one.
-            pct = None
-            try:
-                data = self._query(CMD_GET_BATTERY)
-                if len(data) >= 2 and data[0] == CMD_GET_BATTERY and 1 <= data[1] <= 100:
-                    pct = data[1]
-            except DeviceError:
-                pass
-            if pct is None:
-                status = "En charge (câble USB)"
-            else:
-                status = f"Chargé ({pct}%)" if pct >= 100 else f"En charge ({pct}%)"
-            return {"percentage": pct, "charging": True, "connected": True,
-                    "wireless": False, "status_str": status}
+            # Over the cable the keyboard charges. It gives no level there
+            # (0x83 answers 83 00 01) and the receiver keeps the last one.
+            return {"percentage": None, "charging": True, "connected": True,
+                    "wireless": False, "status_str": "En charge (câble USB)"}
         try:
             self._wait_command_gap(getattr(self, "_pending_gap", 0.0))
             with self.open_device() as dev:

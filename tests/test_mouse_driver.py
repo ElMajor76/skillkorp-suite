@@ -107,17 +107,11 @@ class TestWiredMouse(MouseTestCase):
         super().setUp()
         self.hw.node = make_node(ms.VENDOR_ID, ms.PID_WIRED, M20_VENDOR_DESCRIPTOR)
 
-    def test_cable_means_charging_even_without_report(self):
-        bat = self.drv.get_battery()
-        self.assertTrue(bat["charging"])
-        self.assertIsNone(bat["percentage"])
-        self.assertIn("En charge", bat["status_str"])
-
-    def test_full_on_cable(self):
+    def test_cable_shown_as_charging_like_the_keyboard(self):
         self.hw.input_queue.append(bytes.fromhex("0310400364"))
         bat = self.drv.get_battery(poll_hardware=True)
-        self.assertEqual((bat["percentage"], bat["charging"]), (100, True))
-        self.assertEqual(bat["status_str"], "Chargée (100%)")
+        self.assertEqual((bat["percentage"], bat["charging"], bat["wireless"]), (None, True, False))
+        self.assertEqual(bat["status_str"], "En charge (câble USB)")
 
 
 class TestDriver(MouseTestCase):

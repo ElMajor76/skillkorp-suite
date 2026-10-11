@@ -249,14 +249,10 @@ class TestRemap(KeyboardTestCase):
 
 class TestWiredBattery(KeyboardTestCase):
     def test_cable_reports_charging_without_level(self):
-        self.hw.answers[CMD_GET_BATTERY] = bytes([CMD_GET_BATTERY, 0, 1])  # real K20 answer
         bat = self.drv.get_battery()
         self.assertEqual((bat["percentage"], bat["charging"], bat["wireless"]), (None, True, False))
         self.assertEqual(bat["status_str"], "En charge (câble USB)")
-
-    def test_cable_level_shown_when_given(self):
-        self.hw.answers[CMD_GET_BATTERY] = bytes([CMD_GET_BATTERY, 64, 1])
-        self.assertEqual(self.drv.get_battery()["status_str"], "En charge (64%)")
+        self.assertEqual(self.hw.writes, [])
 
 
 class TestWireless(KeyboardTestCase):
