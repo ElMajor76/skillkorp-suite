@@ -130,6 +130,8 @@ RF_FETCH_REPLY = 0xFC           # move the keyboard's answer into the GET buffer
 RF_STATUS_REPLY_READY = 0       # 1 = an answer from the keyboard is waiting
 RF_STATUS_BATTERY = 1           # battery percentage
 RF_STATUS_OFFLINE = 3           # non-zero while the keyboard is off or asleep
+RF_STATUS_DELIVERED = 5         # 0 while a frame waits to be sent to the keyboard
+RF_DELIVERY_TIMEOUT = 3.0       # max wait for the receiver to pass a frame on
 RF_REPLY_TIMEOUT = 1.5          # max wait for the keyboard's answer over the air
 RF_WRITE_ATTEMPTS = 3           # verified writes over the air (frames can be lost)
 
@@ -680,6 +682,10 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
     #          [FC], then GET_FEATURE returns the keyboard's answer.
     # An answer that is never fetched with FC blocks the receiver: it drops
     # every following frame. _rf_prepare() drains such a leftover answer.
+    # The receiver holds a single frame for the keyboard (status byte 5 is 0
+    # until it is passed on, 60-150 ms when the keyboard is awake): a frame
+    # sent before that replaces the pending one, which is then lost without
+    # error. Every write therefore waits for its delivery.
     @staticmethod
     def _rf_command(dev, *data: int) -> None:
         frame = bytearray(PAYLOAD_LEN)
@@ -725,10 +731,30 @@ class SkillkorpK20Driver(SkillkorpDeviceDriver):
                                   "débranchez-le puis rebranchez-le.")
         return status
 
+    def _rf_wait_delivered(self, dev) -> None:
+        """Wait until the receiver has passed its pending frame on to the keyboard."""
+        deadline = time.monotonic() + RF_DELIVERY_TIMEOUT
+        while True:
+            status = self._rf_status(dev)
+            if len(status) <= RF_STATUS_DELIVERED or status[RF_STATUS_DELIVERED]:
+                return
+            if len(status) > RF_STATUS_OFFLINE and status[RF_STATUS_OFFLINE]:
+                raise KeyboardOfflineError("Le clavier est éteint ou en veille : appuyez sur une touche "
+                                           "puis réessayez.")
+            if time.monotonic() >= deadline:
+                raise DeviceError("Le récepteur 2.4 GHz n'a pas pu transmettre la commande au clavier "
+                                  "(hors de portée ?).")
+            time.sleep(0.02)
+
     def _write_frame(self, dev, payload: bytes):
-        if dev.node.product_id == PID_WIRELESS:
-            self._rf_prepare(dev)
+        wireless = dev.node.product_id == PID_WIRELESS
+        if wireless:
+            status = self._rf_prepare(dev)
+            if len(status) > RF_STATUS_DELIVERED and not status[RF_STATUS_DELIVERED]:
+                self._rf_wait_delivered(dev)
         dev.set_feature(b"\x00" + bytes(payload[:PAYLOAD_LEN]))
+        if wireless:
+            self._rf_wait_delivered(dev)
 
     def _send(self, payloads, settle: float = DELAY_COMMON) -> None:
         """Send one or more 64-byte payloads in a single locked transaction.

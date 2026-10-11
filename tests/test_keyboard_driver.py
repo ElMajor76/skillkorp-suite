@@ -267,7 +267,8 @@ class TestWireless(KeyboardTestCase):
         # Sequence captured from the vendor software.
         self.drv.set_debounce(4)
         self.assertEqual(self.commands()[:5], self.INIT + [CMD_SET_DEBOUNCE])
-        self.assertEqual(self.commands()[5:], [0xF7, 0x91, 0xF7, 0xFC])  # readback check
+        # delivery wait, then readback: status, query, delivery, answer ready, fetch
+        self.assertEqual(self.commands()[5:], [0xF7, 0xF7, 0x91, 0xF7, 0xF7, 0xFC])
         self.assertEqual(self.hw.writes[1][1:3], bytes([0xFE, 64]))
         self.assertEqual(self.hw.writes[3][1:3], bytes([0xF6, 0x0A]))
         self.assertTrue(all(len(w) == 65 for w in self.hw.writes))
@@ -283,6 +284,15 @@ class TestWireless(KeyboardTestCase):
         self.assertEqual(cmds[:5], self.INIT + [0x80])
         self.assertEqual(cmds[-2:], [0xF7, 0xFC])
         self.assertIsNone(self.hw.rf_pending)
+
+    def test_no_frame_sent_before_previous_is_delivered(self):
+        # The receiver holds one frame: sending another before it is passed
+        # on loses the first one (status byte 5 stays 0 meanwhile).
+        self.hw.rf_delivery_polls = 3
+        self.assertTrue(self.drv.set_rgb(mode="static", color="#00FF00", colorful=False))
+        self.assertTrue(self.drv.set_debounce(6))
+        self.assertEqual(self.hw.rf_overwritten, 0)
+        self.assertEqual(self.hw.answers[0x87][5:8], bytes([0, 255, 0]))
 
     def test_lost_write_is_resent_after_readback(self):
         # A frame relayed while the keyboard sends keystrokes can be lost

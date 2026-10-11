@@ -23,9 +23,11 @@ Validée sur le matériel (K20 en 2.4 GHz et en filaire, M20 par récepteur).
   réponses par `FC`) : réglages et lectures fonctionnent sans fil, une
   réponse restée en attente (qui bloquait le récepteur) est récupérée avant
   chaque envoi. Batterie lue sur le récepteur.
-- Réglages du clavier en 2.4 GHz vérifiés par relecture et renvoyés si
-  besoin : une trame relayée pendant que le clavier transmet des frappes
-  peut se perdre sans erreur (mis en évidence par `tools/hwtest.py`).
+- Réglages du clavier en 2.4 GHz fiables : le récepteur ne garde qu'une
+  trame à la fois, et une trame envoyée avant que la précédente soit
+  transmise l'effaçait sans erreur. Le pilote attend la transmission (octet
+  5 de l'état `F7`), puis relit chaque réglage et le renvoie si besoin
+  (mis en évidence par `tools/hwtest.py`).
 
 ### Ajouté
 - Réglages du clavier envoyés pendant sa veille : enregistrés puis appliqués

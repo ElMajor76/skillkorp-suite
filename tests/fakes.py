@@ -100,6 +100,9 @@ class FakeHardware:
         self.rf_keyboard_answers = True
         self.rf_lose_writes = 0  # next N keyboard writes lost over the air
         self.rf_ignore_queries = 0  # next N GET commands left unanswered
+        self.rf_delivery_polls = 0  # F7 polls during which a frame stays pending
+        self._rf_undelivered = 0
+        self.rf_overwritten = 0     # frames replaced before delivery (lost)
 
     @property
     def is_receiver(self) -> bool:
@@ -109,17 +112,29 @@ class FakeHardware:
         cmd = frame[1] if len(frame) > 1 else 0
         if cmd == 0xF7:
             status = bytearray(self.rf_status)
-            status[0] = 1 if self.rf_pending is not None else 0
+            if status:
+                status[0] = 1 if self.rf_pending is not None else 0
+            if len(status) > 5:
+                status[5] = 0 if self._rf_undelivered else 1
+            if self._rf_undelivered:
+                self._rf_undelivered -= 1
             self.rf_buffer = bytes(status)
-        elif cmd == 0xFC:
+            return
+        if cmd == 0xFC:
             if self.rf_pending is not None:
                 self.rf_buffer, self.rf_pending = self.rf_pending, None
-        elif cmd in (0xFE, 0xF6):
-            pass
-        elif cmd & 0x80 and self.rf_ignore_queries:
-            self.rf_ignore_queries -= 1
-        elif cmd & 0x80 and self.rf_keyboard_answers:
-            self.rf_pending = self.answers.get(cmd, bytes([cmd]))
+            return
+        if cmd in (0xFE, 0xF6):
+            return
+        # A frame for the keyboard: the receiver holds it until delivery.
+        if self._rf_undelivered:
+            self.rf_overwritten += 1  # the real receiver would lose the previous frame
+        self._rf_undelivered = self.rf_delivery_polls
+        if cmd & 0x80:
+            if self.rf_ignore_queries:
+                self.rf_ignore_queries -= 1
+            elif self.rf_keyboard_answers:
+                self.rf_pending = self.answers.get(cmd, bytes([cmd]))
         elif self.rf_lose_writes:
             self.rf_lose_writes -= 1
         else:
