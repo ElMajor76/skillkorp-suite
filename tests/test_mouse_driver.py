@@ -1,655 +1,231 @@
 """
-Tests unitaires pour skillkorp.devices.mouse (SkillkorpM20Driver) et le
-ProfileManager unifié côté souris. Porté depuis skillkorp-m20/tests/test_driver.py,
-avec la même rigueur : mock de fcntl.ioctl, vérification des offsets exacts
-par rapport à la description du protocole dans skillkorp-m20/README.md.
+Tests du pilote souris M20 contre MU_SkillKorp.exe (construction des rapports
+0x04, 0x05, 0x06, 0x08, 0x0C). FakeHardware utilise le vrai descripteur HID
+de la souris, donc les longueurs envoyées sont celles déclarées par l'appareil.
 """
 
-import os
 import json
-import tempfile
 import unittest
-from unittest.mock import patch
 
-import skillkorp.devices.mouse as mouse
+import skillkorp.devices.mouse as ms
 from skillkorp.devices.mouse import (
-    POLLING_RATE_MAP,
-    LIGHT_MODES,
-    BUTTON_ACTIONS,
-    PHYSICAL_BTN_TO_SLOT,
-    SkillkorpM20Driver,
-    _HIDIOCSFEATURE,
+    BUTTON_ACTIONS, LIGHT_MODES, PHYSICAL_BTN_TO_SLOT, POLLING_RATE_MAP, SkillkorpM20Driver,
+    build_dpi_frame, build_light_power_frame, build_query_frame, parse_status_report,
 )
-from skillkorp.profiles.manager import ProfileManager, DEFAULT_PROFILES_MOUSE
+from tests.fakes import M20_VENDOR_DESCRIPTOR, FakeHardware, isolated_home, make_node
 
 
-class TestHidiocsMacro(unittest.TestCase):
-    """Tests du calcul ioctl HIDIOCSFEATURE."""
+def csum16(buf, start, end):
+    s = sum(buf[start:end]) & 0xFFFF
+    return [(s >> 8) & 0xFF, s & 0xFF]
 
-    def test_hidiocsfeature_9bytes(self):
-        """Report ID 0x06 polling rate: 9 bytes."""
-        result = _HIDIOCSFEATURE(9)
-        self.assertIsInstance(result, int)
-        self.assertGreater(result, 0)
-        expected = (3 << 30) | (9 << 16) | (ord('H') << 8) | 0x06
-        self.assertEqual(result, expected)
 
-    def test_hidiocsfeature_56bytes(self):
-        """Report ID 0x04 DPI sensor: 56 bytes."""
-        result = _HIDIOCSFEATURE(56)
-        expected = (3 << 30) | (56 << 16) | (ord('H') << 8) | 0x06
-        self.assertEqual(result, expected)
+class MouseTestCase(unittest.TestCase):
+    def setUp(self):
+        self._home = isolated_home()
+        self._home.__enter__()
+        self.hw = FakeHardware(SkillkorpM20Driver, make_node(ms.VENDOR_ID, ms.PID_WIRELESS, M20_VENDOR_DESCRIPTOR))
+        self._hw = self.hw.installed()
+        self._hw.__enter__()
+        self.drv = SkillkorpM20Driver()
 
-    def test_hidiocsfeature_15bytes(self):
-        """Report ID 0x05 lighting/power: 15 bytes."""
-        result = _HIDIOCSFEATURE(15)
-        expected = (3 << 30) | (15 << 16) | (ord('H') << 8) | 0x06
-        self.assertEqual(result, expected)
+    def tearDown(self):
+        self._hw.__exit__(None, None, None)
+        self._home.__exit__(None, None, None)
+
+    def sent(self, report_id):
+        return [w for w in self.hw.writes if w[0] == report_id]
 
 
 class TestConstants(unittest.TestCase):
-    """Tests des constantes du driver."""
-
-    def test_polling_rate_map_keys(self):
-        self.assertEqual(set(POLLING_RATE_MAP.keys()), {125, 250, 500, 1000})
-
-    def test_polling_rate_map_complement(self):
-        """interval + not_interval doit valoir 0xFF pour chaque taux."""
+    def test_polling_complement(self):
         for rate, info in POLLING_RATE_MAP.items():
-            self.assertEqual(
-                info["interval"] + info["not_interval"], 0xFF,
-                f"Complément incorrect pour {rate} Hz",
-            )
-
-    def test_light_modes_structure(self):
-        ids = [m[2] for m in LIGHT_MODES]
-        self.assertEqual(len(ids), len(set(ids)), "IDs de modes RGB en double")
-        for mode in LIGHT_MODES:
-            self.assertEqual(len(mode), 3)
-            self.assertIsInstance(mode[0], str)
-            self.assertIsInstance(mode[1], str)
-            self.assertIsInstance(mode[2], int)
-
-    def test_button_actions_structure(self):
-        for key, val in BUTTON_ACTIONS.items():
-            self.assertEqual(len(val), 4, f"Action '{key}' mal formée")
-            self.assertIsInstance(val[0], str)
-            for byte_val in val[1:]:
-                self.assertGreaterEqual(byte_val, 0)
-                self.assertLessEqual(byte_val, 0xFF)
-
-    def test_physical_btn_to_slot_keys(self):
-        self.assertEqual(set(PHYSICAL_BTN_TO_SLOT.keys()), {1, 2, 3, 4, 5, 6})
-
-    def test_physical_btn_to_slot_slots_in_range(self):
-        for btn, slot in PHYSICAL_BTN_TO_SLOT.items():
-            self.assertGreaterEqual(slot, 0)
-            self.assertLessEqual(slot, 17, f"Slot {slot} du bouton {btn} hors limites")
-
-    def test_device_type(self):
-        self.assertEqual(SkillkorpM20Driver.device_type, "mouse")
-
-
-class TestReport0x05Checksum(unittest.TestCase):
-    """Tests du buffer et checksum du Report 0x05 (éclairage + veille).
-
-    README (skillkorp-m20) : "Mise en veille & Réveil (Report ID 0x05 - 15 octets) :
-    délai avant mise en veille matérielle et mode de réveil avec somme de contrôle
-    sur 16 bits." Ce test verrouille le format exact : le checksum couvre les octets
-    3 à 10 (mode/luminosité-vitesse/couleur/minuteur/réveil) et est stocké en
-    big-endian aux octets 11-12.
-    """
-
-    def _make_driver(self, config=None):
-        default_config = {
-            "light_mode": "static",
-            "brightness": 8,
-            "speed": 4,
-            "light_color": [255, 0, 0],
-            "sleep_timer_minutes": 5,
-            "move_to_wake": True,
-            "polling_rate": 1000,
-            "dpi_stages": [800, 1600, 3200],
-            "active_stage": 2,
-            "lod": 1,
-            "debounce": 4,
-            "ripple": False,
-            "angle_snap": False,
-            "motion_sync": True,
-            "buttons": {"1": "left_click", "2": "right_click"},
-            "battery": 100,
-            "charging": False,
-        }
-        if config:
-            default_config.update(config)
-        with patch.object(SkillkorpM20Driver, "_load_or_default_config", return_value=default_config):
-            with patch.object(SkillkorpM20Driver, "find_device", return_value=None):
-                driver = SkillkorpM20Driver.__new__(SkillkorpM20Driver)
-                driver.dev_path = None
-                driver.config = default_config
-                driver._config_mtime = os.path.getmtime(mouse.DEFAULT_PROFILE_FILE) if os.path.exists(mouse.DEFAULT_PROFILE_FILE) else 0.0
-        return driver
-
-    def _call_lighting_report(self, driver, **kwargs):
-        captured = []
-
-        def mock_send(self, buf, retries=3):
-            captured.append(bytes(buf))
-            return True
-
-        with patch.object(SkillkorpM20Driver, "_send_feature_report", mock_send):
-            driver._send_lighting_and_power_report(**kwargs)
-
-        self.assertTrue(captured, "Aucun buffer envoyé")
-        return captured[0]
-
-    def test_report_id_and_length(self):
-        driver = self._make_driver()
-        buf = self._call_lighting_report(
-            driver, mode="static", brightness=8, speed=4,
-            color=(255, 0, 0), sleep_timer_minutes=5, move_to_wake=True,
-        )
-        self.assertEqual(buf[0], 0x05, "Report ID incorrect")
-        self.assertEqual(buf[1], 0x0F, "Longueur incorrecte (attendu 15)")
-
-    def test_profile_index(self):
-        driver = self._make_driver()
-        buf = self._call_lighting_report(
-            driver, mode="static", brightness=8, speed=4,
-            color=(255, 0, 0), sleep_timer_minutes=5, move_to_wake=True,
-        )
-        self.assertEqual(buf[2], 0x01)
-
-    def test_checksum_static_red(self):
-        driver = self._make_driver()
-        buf = self._call_lighting_report(
-            driver, mode="static", brightness=8, speed=4,
-            color=(255, 0, 0), sleep_timer_minutes=5, move_to_wake=True,
-        )
-        csum_expected = sum(buf[3:11]) & 0xFFFF
-        csum_actual = (buf[11] << 8) | buf[12]
-        self.assertEqual(csum_actual, csum_expected, f"Checksum incorrect: buf={buf.hex()}")
-
-    def test_checksum_breathing_blue(self):
-        driver = self._make_driver()
-        buf = self._call_lighting_report(
-            driver, mode="breathing", brightness=4, speed=6,
-            color=(0, 0, 255), sleep_timer_minutes=10, move_to_wake=False,
-        )
-        csum_expected = sum(buf[3:11]) & 0xFFFF
-        csum_actual = (buf[11] << 8) | buf[12]
-        self.assertEqual(csum_actual, csum_expected)
-
-    def test_sleep_timer_byte(self):
-        driver = self._make_driver()
-        for minutes in [1, 5, 30, 60]:
-            buf = self._call_lighting_report(
-                driver, mode="static", brightness=8, speed=4,
-                color=(255, 255, 255), sleep_timer_minutes=minutes, move_to_wake=True,
-            )
-            self.assertEqual(buf[9], minutes, f"sleep_timer {minutes} min mal encodé")
-
-    def test_move_to_wake_encoding(self):
-        driver = self._make_driver()
-        buf_move = self._call_lighting_report(
-            driver, mode="static", brightness=8, speed=4,
-            color=(255, 0, 0), sleep_timer_minutes=5, move_to_wake=True,
-        )
-        self.assertEqual(buf_move[10], 0x00, "move_to_wake=True doit encoder 0x00")
-
-        buf_click = self._call_lighting_report(
-            driver, mode="static", brightness=8, speed=4,
-            color=(255, 0, 0), sleep_timer_minutes=5, move_to_wake=False,
-        )
-        self.assertEqual(buf_click[10], 0x01, "move_to_wake=False doit encoder 0x01")
-
-    def test_rgb_color_bytes(self):
-        driver = self._make_driver()
-        buf = self._call_lighting_report(
-            driver, mode="static", brightness=8, speed=4,
-            color=(123, 200, 42), sleep_timer_minutes=5, move_to_wake=True,
-        )
-        self.assertEqual(buf[6], 123)
-        self.assertEqual(buf[7], 200)
-        self.assertEqual(buf[8], 42)
-
-    def test_brightness_speed_packing(self):
-        driver = self._make_driver()
-        buf = self._call_lighting_report(
-            driver, mode="static", brightness=5, speed=3,
-            color=(0, 0, 0), sleep_timer_minutes=5, move_to_wake=True,
-        )
-        expected = ((5 & 0x0F) << 4) | (3 & 0x0F)
-        self.assertEqual(buf[4], expected)
-
-    def test_mode_id_static(self):
-        driver = self._make_driver()
-        buf = self._call_lighting_report(
-            driver, mode="static", brightness=8, speed=4,
-            color=(255, 0, 0), sleep_timer_minutes=5, move_to_wake=True,
-        )
-        self.assertEqual(buf[3], 0x20)
-
-    def test_mode_id_breathing(self):
-        driver = self._make_driver()
-        buf = self._call_lighting_report(
-            driver, mode="breathing", brightness=8, speed=4,
-            color=(255, 0, 0), sleep_timer_minutes=5, move_to_wake=True,
-        )
-        self.assertEqual(buf[3], 0x30)
-
-    def test_buffer_length(self):
-        driver = self._make_driver()
-        buf = self._call_lighting_report(
-            driver, mode="static", brightness=8, speed=4,
-            color=(255, 0, 0), sleep_timer_minutes=5, move_to_wake=True,
-        )
-        self.assertEqual(len(buf), 15)
-
-
-class TestReport0x04DPI(unittest.TestCase):
-    """Tests du buffer Report 0x04 (DPI + capteur)."""
-
-    def _make_driver_and_capture(self, stages, active_stage=1):
-        config = {
-            "polling_rate": 1000,
-            "dpi_stages": stages,
-            "active_stage": active_stage,
-            "lod": 1,
-            "debounce": 4,
-            "ripple": False,
-            "angle_snap": False,
-            "motion_sync": True,
-            "light_mode": "static",
-            "brightness": 8,
-            "speed": 4,
-            "light_color": [255, 0, 0],
-            "sleep_timer_minutes": 5,
-            "move_to_wake": True,
-            "buttons": {},
-            "battery": 100,
-            "charging": False,
-        }
-        with patch.object(SkillkorpM20Driver, "_load_or_default_config", return_value=config):
-            with patch.object(SkillkorpM20Driver, "find_device", return_value=None):
-                driver = SkillkorpM20Driver.__new__(SkillkorpM20Driver)
-                driver.dev_path = None
-                driver.config = config.copy()
-                driver._config_mtime = os.path.getmtime(mouse.DEFAULT_PROFILE_FILE) if os.path.exists(mouse.DEFAULT_PROFILE_FILE) else 0.0
-
-        captured = []
-
-        def mock_send(self, buf, retries=3):
-            captured.append(bytes(buf))
-            return True
-
-        with patch.object(SkillkorpM20Driver, "_send_feature_report", mock_send):
-            with patch.object(SkillkorpM20Driver, "_save_config"):
-                driver.set_dpi_and_sensor(stages=stages, active_stage=active_stage)
-
-        return captured[0] if captured else None
-
-    def test_report_id_0x04(self):
-        buf = self._make_driver_and_capture([800, 1600], active_stage=1)
-        self.assertIsNotNone(buf)
-        self.assertEqual(buf[0], 0x04)
-
-    def test_dpi_encoding_800(self):
-        buf = self._make_driver_and_capture([800], active_stage=1)
-        self.assertIsNotNone(buf)
-        enc = (800 // 50) - 1
-        self.assertEqual(buf[8], enc & 0xFF)
-        self.assertEqual(buf[16], (enc >> 8) & 0xFF)
-
-    def test_dpi_encoding_26000(self):
-        buf = self._make_driver_and_capture([26000], active_stage=1)
-        self.assertIsNotNone(buf)
-        enc = (26000 // 50) - 1
-        self.assertEqual(buf[8], enc & 0xFF)
-        self.assertEqual(buf[16], (enc >> 8) & 0xFF)
-
-    def test_active_stage_byte(self):
-        buf = self._make_driver_and_capture([400, 800, 1600], active_stage=2)
-        self.assertIsNotNone(buf)
-        self.assertEqual(buf[24], 2)
-
-    def test_stages_mask(self):
-        for n in range(1, 7):
-            stages = [800] * n
-            buf = self._make_driver_and_capture(stages, active_stage=1)
-            expected_mask = (1 << n) - 1
-            self.assertEqual(buf[5], expected_mask, f"Masque incorrect pour {n} étapes")
-
-
-class TestBatteryInputReportParsing(unittest.TestCase):
-    """README : requête 0x0C, réception de la trame 0x03 0x10 0x40 [statut] [pourcentage]."""
-
-    def _make_driver(self):
-        config = {
-            "polling_rate": 1000, "dpi_stages": [800, 1600], "active_stage": 1,
-            "lod": 1, "debounce": 4, "ripple": False, "angle_snap": False,
-            "motion_sync": True, "light_mode": "static", "brightness": 8,
-            "speed": 4, "light_color": [255, 0, 0], "sleep_timer_minutes": 5,
-            "move_to_wake": True, "buttons": {}, "battery": 50, "charging": False,
-        }
-        with patch.object(SkillkorpM20Driver, "_load_or_default_config", return_value=config):
-            with patch.object(SkillkorpM20Driver, "find_device", return_value=None):
-                driver = SkillkorpM20Driver.__new__(SkillkorpM20Driver)
-                driver.dev_path = None
-                driver.config = config.copy()
-                driver._config_mtime = 0.0
-        return driver
-
-    def test_battery_frame_0x03_0x10_0x40_charging(self):
-        driver = self._make_driver()
-        # 0x03 0x10 0x40 [statut=2 (charging, per query_status: charging = status == 2)] [pourcentage=77]
-        frame = bytes([0x03, 0x10, 0x40, 0x02, 77])
-        with patch.object(driver, "is_connected", return_value=True):
-            with patch.object(driver, "_read_input_reports", return_value=[frame]):
-                with patch.object(SkillkorpM20Driver, "_save_config"):
-                    status = driver.query_status()
-        self.assertEqual(status["battery"], 77)
-        self.assertTrue(status["charging"])
-
-    def test_battery_frame_0x03_0x10_0x40_not_charging(self):
-        driver = self._make_driver()
-        frame = bytes([0x03, 0x10, 0x40, 0x00, 33])
-        with patch.object(driver, "is_connected", return_value=True):
-            with patch.object(driver, "_read_input_reports", return_value=[frame]):
-                with patch.object(SkillkorpM20Driver, "_save_config"):
-                    status = driver.query_status()
-        self.assertEqual(status["battery"], 33)
-        self.assertFalse(status["charging"])
-
-
-class TestQueryStatusClamp(unittest.TestCase):
-    """Tests du clamp active_stage dans query_status."""
-
-    def _make_driver_with_config(self, config):
-        with patch.object(SkillkorpM20Driver, "_load_or_default_config", return_value=config):
-            with patch.object(SkillkorpM20Driver, "find_device", return_value=None):
-                driver = SkillkorpM20Driver.__new__(SkillkorpM20Driver)
-                driver.dev_path = None
-                driver.config = config.copy()
-                driver._config_mtime = os.path.getmtime(mouse.DEFAULT_PROFILE_FILE) if os.path.exists(mouse.DEFAULT_PROFILE_FILE) else 0.0
-        return driver
-
-    def test_active_stage_clamped_when_out_of_bounds(self):
-        config = {
-            "polling_rate": 1000, "dpi_stages": [800, 1600], "active_stage": 5,
-            "lod": 1, "debounce": 4, "ripple": False, "angle_snap": False,
-            "motion_sync": True, "light_mode": "static", "brightness": 8,
-            "speed": 4, "light_color": [255, 0, 0], "sleep_timer_minutes": 5,
-            "move_to_wake": True, "buttons": {}, "battery": 100, "charging": False,
-        }
-        driver = self._make_driver_with_config(config)
-        with patch.object(driver, "is_connected", return_value=False):
-            with patch.object(driver, "_read_input_reports", return_value=[]):
-                status = driver.query_status()
-                self.assertIsNotNone(status)
-                self.assertIn(status["active_dpi"], config["dpi_stages"])
-
-    def test_active_stage_1_is_valid(self):
-        config = {
-            "polling_rate": 1000, "dpi_stages": [400, 800], "active_stage": 1,
-            "lod": 1, "debounce": 4, "ripple": False, "angle_snap": False,
-            "motion_sync": True, "light_mode": "static", "brightness": 8,
-            "speed": 4, "light_color": [255, 0, 0], "sleep_timer_minutes": 5,
-            "move_to_wake": True, "buttons": {}, "battery": 100, "charging": False,
-        }
-        driver = self._make_driver_with_config(config)
-        with patch.object(driver, "is_connected", return_value=False):
-            with patch.object(driver, "_read_input_reports", return_value=[]):
-                status = driver.query_status()
-                self.assertEqual(status["active_dpi"], 400)
-
-
-class TestSetButtonsSlotMapping(unittest.TestCase):
-    """Tests du mappage boutons physiques -> slots firmware (Report 0x08)."""
-
-    def _make_driver(self):
-        config = {
-            "polling_rate": 1000, "dpi_stages": [800], "active_stage": 1,
-            "lod": 1, "debounce": 4, "ripple": False, "angle_snap": False,
-            "motion_sync": True, "light_mode": "static", "brightness": 8,
-            "speed": 4, "light_color": [255, 0, 0], "sleep_timer_minutes": 5,
-            "move_to_wake": True, "buttons": {}, "battery": 100, "charging": False,
-        }
-        with patch.object(SkillkorpM20Driver, "_load_or_default_config", return_value=config):
-            with patch.object(SkillkorpM20Driver, "find_device", return_value=None):
-                driver = SkillkorpM20Driver.__new__(SkillkorpM20Driver)
-                driver.dev_path = None
-                driver.config = config.copy()
-                driver._config_mtime = os.path.getmtime(mouse.DEFAULT_PROFILE_FILE) if os.path.exists(mouse.DEFAULT_PROFILE_FILE) else 0.0
-        return driver
-
-    def test_set_buttons_report_id(self):
-        driver = self._make_driver()
-        captured = []
-
-        def mock_send(self, buf, retries=3):
-            captured.append(bytes(buf))
-            return True
-
-        with patch.object(SkillkorpM20Driver, "_send_feature_report", mock_send):
-            with patch.object(SkillkorpM20Driver, "_save_config"):
-                driver.set_buttons({1: "left_click", 2: "right_click"})
-
-        self.assertTrue(captured)
-        self.assertEqual(captured[0][0], 0x08)
-
-    def test_physical_btn_slot_mapping(self):
-        driver = self._make_driver()
-        captured = []
-
-        def mock_send(self, buf, retries=3):
-            captured.append(bytes(buf))
-            return True
-
-        with patch.object(SkillkorpM20Driver, "_send_feature_report", mock_send):
-            with patch.object(SkillkorpM20Driver, "_save_config"):
-                driver.set_buttons({1: "left_click", 2: "right_click", 6: "dpi_cycle"})
-
-        self.assertTrue(captured)
-        buf = captured[0]
-        dpi_code = BUTTON_ACTIONS["dpi_cycle"][1]
-        slot3_offset = 3 + 3 * 3  # = 12
-        self.assertEqual(buf[slot3_offset], dpi_code, f"Bouton 6 (Slot 3) devrait avoir code {dpi_code:#04x}, buf={buf.hex()}")
-
-
-class TestApplyProfile(unittest.TestCase):
-    """apply_profile() est le nouveau point d'entrée unifié appelé par ProfileManager."""
-
-    def _make_driver(self):
-        config = {
-            "polling_rate": 1000, "dpi_stages": [800, 1600], "active_stage": 1,
-            "lod": 1, "debounce": 4, "ripple": False, "angle_snap": False,
-            "motion_sync": True, "light_mode": "static", "brightness": 8,
-            "speed": 4, "light_color": [255, 0, 0], "sleep_timer_minutes": 5,
-            "move_to_wake": True, "buttons": {}, "battery": 100, "charging": False,
-        }
-        with patch.object(SkillkorpM20Driver, "_load_or_default_config", return_value=config):
-            with patch.object(SkillkorpM20Driver, "find_device", return_value=None):
-                driver = SkillkorpM20Driver.__new__(SkillkorpM20Driver)
-                driver.dev_path = None
-                driver.config = config.copy()
-                driver._config_mtime = 0.0
-        return driver
-
-    def test_apply_profile_calls_all_setters(self):
-        driver = self._make_driver()
-        with patch.object(driver, "set_dpi_and_sensor") as m_dpi, \
-             patch.object(driver, "set_polling_rate") as m_rate, \
-             patch.object(driver, "set_rgb_lighting") as m_rgb, \
-             patch.object(driver, "set_buttons") as m_btn, \
-             patch.object(driver, "set_power_settings") as m_power:
-            profile = DEFAULT_PROFILES_MOUSE["gaming_fps"]
-            success = driver.apply_profile(profile)
-            self.assertTrue(success)
-            m_dpi.assert_called_once()
-            m_rate.assert_called_once_with(profile["polling_rate"])
-            m_rgb.assert_called_once()
-            m_btn.assert_called_once()
-            m_power.assert_called_once()
-
-
-class TestProfileManagerMouse(unittest.TestCase):
-    """Tests du gestionnaire multi-profils unifié, côté souris."""
-
+            self.assertEqual(info["interval"] + info["not_interval"], 0xFF, rate)
+
+    def test_light_modes_are_zero_based(self):
+        codes = [c for _, _, c in LIGHT_MODES]
+        self.assertEqual(codes, list(range(12)))
+        self.assertEqual(dict((k, c) for k, _, c in LIGHT_MODES)["static"], 1)
+
+    def test_buttons(self):
+        self.assertEqual(set(PHYSICAL_BTN_TO_SLOT), {1, 2, 3, 4, 5, 6})
+        self.assertEqual(BUTTON_ACTIONS["undo"][1:], (0x11, 0x01, 0x1A))
+        self.assertEqual(BUTTON_ACTIONS["select_all"][1:], (0x11, 0x01, 0x14))
+
+
+class TestFrames(unittest.TestCase):
+    def test_report5_matches_vendor_defaults(self):
+        # vendor defaults: static, brightness 8, speed 6, sleep 10 min, LED off 1 min, debounce 4 ms
+        f = build_light_power_frame("static", 8, 6, (0, 0, 0xFF), 10, 1, 4)
+        self.assertEqual(len(f), 15)
+        self.assertEqual(list(f[0:11]), [0x05, 0x0F, 0x01, 0x10, 0x03, 0xA8, 0, 0, 0xFF, 1, 4])
+        self.assertEqual(list(f[11:13]), csum16(f, 3, 11))
+
+    def test_report5_sleep_split_over_nibbles(self):
+        f = build_light_power_frame("static", 8, 8, (0, 0, 0), 60, 1, 4)  # 60 = 0x3C
+        self.assertEqual(f[4] & 0xF0, 0x30)
+        self.assertEqual(f[5] >> 4, 0xC)
+        self.assertEqual(f[4] & 0x0F, 1)  # 9 - speed 8
+
+    def test_report5_brightness_only_for_static_effects(self):
+        self.assertEqual(build_light_power_frame("breathing", 3, 6, (1, 2, 3), 10, 1, 4)[5] & 0x0F, 8)
+        self.assertEqual(build_light_power_frame("static_mixed", 3, 6, (1, 2, 3), 10, 1, 4)[5] & 0x0F, 3)
+        self.assertEqual(build_light_power_frame("off", 3, 6, (1, 2, 3), 10, 1, 4)[3], 0x00)
+
+    def test_report5_debounce_byte(self):
+        self.assertEqual(build_light_power_frame("static", 8, 6, (0, 0, 0), 10, 1, 25)[10], 25)
+
+    def test_report4(self):
+        f = build_dpi_frame([400, 800, 26000], 2, 2, True, False, True, [(1, 2, 3)])
+        self.assertEqual(list(f[0:8]), [0x04, 0x38, 0x01, 1, 1, 0b111, 0, 1])
+        self.assertEqual((f[8], f[16]), (7, 0))          # 400/50 - 1
+        self.assertEqual((f[10], f[18]), (519 & 0xFF, 519 >> 8))  # 26000/50 - 1
+        self.assertEqual(f[24], 2)
+        self.assertEqual(list(f[25:28]), [1, 2, 3])
+        self.assertEqual(f[49], 1)
+        self.assertEqual(list(f[50:52]), csum16(f, 3, 50))
+        self.assertFalse(any(f[52:]), "padding must stay zero (trimmed to the descriptor size)")
+
+    def test_query_frame(self):
+        self.assertEqual(list(build_query_frame()[0:6]), [0x0C, 0x0A, 0x01, 0xFE, 0x01, 0xFE])
+
+    def test_status_parsing(self):
+        self.assertEqual(parse_status_report(bytes([3, 0x10, 0x40, 2, 87])),
+                         {"type": "battery", "percentage": 87, "charging": True})
+        self.assertEqual(parse_status_report(bytes([3, 0, 0x10, 3, 0])), {"type": "dpi_stage", "stage": 3})
+        # Reports captured on the real M20: on battery (state 1), on USB-C (3).
+        self.assertEqual(parse_status_report(bytes.fromhex("031040015b")),
+                         {"type": "battery", "percentage": 91, "charging": False})
+        self.assertEqual(parse_status_report(bytes.fromhex("0310400364")),
+                         {"type": "battery", "percentage": 100, "charging": True})
+        self.assertIsNone(parse_status_report(bytes([3, 0, 0x40, 0, 250])))
+        self.assertIsNone(parse_status_report(bytes([2, 0, 0x40, 0, 50])))
+
+
+class TestWiredMouse(MouseTestCase):
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
-        self.pm = ProfileManager(
-            "mouse",
-            profiles_dir=os.path.join(self.tmpdir, "profiles"),
-            state_file=os.path.join(self.tmpdir, "state.json"),
-        )
+        super().setUp()
+        self.hw.node = make_node(ms.VENDOR_ID, ms.PID_WIRED, M20_VENDOR_DESCRIPTOR)
 
-    def _write_profile_file(self, data):
-        path = os.path.join(self.tmpdir, "test_import.json")
-        with open(path, "w") as f:
-            json.dump(data, f)
-        return path
+    def test_cable_shown_as_charging_like_the_keyboard(self):
+        self.hw.input_queue.append(bytes.fromhex("0310400364"))
+        bat = self.drv.get_battery(poll_hardware=True)
+        self.assertEqual((bat["percentage"], bat["charging"], bat["wireless"]), (None, True, False))
+        self.assertEqual(bat["status_str"], "En charge (câble USB)")
 
-    def test_default_profiles_created(self):
-        ids = [p["id"] for p in self.pm.list_profiles()]
-        self.assertIn("default", ids)
-        self.assertIn("gaming_fps", ids)
-        self.assertIn("office_economy", ids)
 
-    def test_profiles_tagged_with_device_type(self):
-        for p in self.pm.list_profiles():
-            self.assertEqual(p["device_type"], "mouse")
+class TestDriver(MouseTestCase):
+    def test_reports_are_sized_by_descriptor(self):
+        self.drv.set_dpi_and_sensor(stages=[800, 1600])
+        self.drv.set_rgb_lighting("static")
+        self.drv.set_polling_rate(500)
+        self.assertEqual(len(self.sent(0x04)[-1]), 52)   # 51 data bytes + report ID
+        self.assertEqual(len(self.sent(0x05)[-1]), 13)
+        self.assertEqual(len(self.sent(0x06)[-1]), 9)
 
-    def test_valid_profile_imports_ok(self):
-        data = {
-            "id": "test", "name": "Test", "dpi_stages": [800, 1600],
-            "active_stage": 1, "polling_rate": 1000,
-            "buttons": {"1": "left_click", "2": "right_click"},
-        }
-        path = self._write_profile_file(data)
-        result_id = self.pm.import_profile(path)
-        self.assertEqual(result_id, "test")
-
-    def test_invalid_dpi_raises(self):
-        data = {"dpi_stages": [100000], "buttons": {}}
-        path = self._write_profile_file(data)
+    def test_dpi_rounding_and_validation(self):
+        self.drv.set_dpi_and_sensor(stages=[812, 1600], active_stage=1)
+        self.assertEqual(self.drv.config["dpi_stages"], [800, 1600])
         with self.assertRaises(ValueError):
-            self.pm.import_profile(path)
-
-    def test_invalid_polling_rate_raises(self):
-        data = {"polling_rate": 750, "buttons": {}}
-        path = self._write_profile_file(data)
+            self.drv.set_dpi_and_sensor(stages=[10])
         with self.assertRaises(ValueError):
-            self.pm.import_profile(path)
-
-    def test_invalid_button_action_raises(self):
-        data = {"buttons": {"1": "teleport"}}
-        path = self._write_profile_file(data)
+            self.drv.set_dpi_and_sensor(stages=[800] * 9)
         with self.assertRaises(ValueError):
-            self.pm.import_profile(path)
+            self.drv.set_dpi_and_sensor(active_stage=7)
 
-    def test_invalid_button_number_raises(self):
-        data = {"buttons": {"9": "left_click"}}
-        path = self._write_profile_file(data)
+    def test_debounce_goes_through_report5(self):
+        self.assertTrue(self.drv.set_dpi_and_sensor(debounce=12))
+        self.assertEqual(self.sent(0x05)[-1][10], 12)
+        self.assertEqual(self.drv.config["debounce"], 12)
         with self.assertRaises(ValueError):
-            self.pm.import_profile(path)
+            self.drv.set_debounce(1)
 
-    def test_invalid_active_stage_raises(self):
-        data = {"dpi_stages": [800, 1600], "active_stage": 5, "buttons": {}}
-        path = self._write_profile_file(data)
+    def test_lighting_preserves_power_settings(self):
+        self.drv.set_power_settings(sleep_timer_minutes=20, led_off_minutes=5)
+        self.drv.set_rgb_lighting("breathing", speed=8, color=(10, 20, 30))
+        f = self.sent(0x05)[-1]
+        self.assertEqual((f[4] & 0xF0) | (f[5] >> 4), 20)
+        self.assertEqual(f[9], 5)
+        self.assertEqual(list(f[6:9]), [10, 20, 30])
+
+    def test_move_to_wake_is_ignored(self):
+        self.assertTrue(self.drv.set_power_settings(move_to_wake=False))
+        self.assertNotIn("move_to_wake", self.drv.config)
+
+    def test_missing_ack_is_retried_then_fails(self):
+        self.hw.auto_ack = False
+        self.assertFalse(self.drv.set_polling_rate(500))
+        self.assertEqual(len(self.sent(0x06)), SkillkorpM20Driver.SEND_ATTEMPTS)
+        self.assertIn("confirmé", self.drv.last_error)
+        self.assertEqual(self.drv.config["polling_rate"], 1000)
+
+    def test_lost_frames_are_resent_until_acknowledged(self):
+        # An idle mouse misses several frames in a row (measured on the M20).
+        self.hw.auto_ack = False
+        sends = []
+
+        def on_write(buf):
+            sends.append(buf)
+            if len(sends) == 3:
+                self.hw.input_queue.append(bytes([3, 0x10, 0x50, 0, buf[0]]))
+        self.hw.on_write = on_write
+        self.assertTrue(self.drv.set_polling_rate(500))
+        self.assertEqual(len(self.sent(0x06)), 3)
+        self.assertEqual(self.drv.config["polling_rate"], 500)
+
+    def test_ack_parsing(self):
+        self.assertEqual(parse_status_report(bytes([3, 0x10, 0x50, 0, 6])), {"type": "ack", "report": 6})
+
+    def test_failure_keeps_config(self):
+        self.hw.fail_writes = 1
+        self.assertFalse(self.drv.set_polling_rate(125))
+        self.assertEqual(self.drv.config["polling_rate"], 1000)
+
+    def test_buttons_safety(self):
         with self.assertRaises(ValueError):
-            self.pm.import_profile(path)
+            self.drv.set_buttons({1: "copy"})
+        self.assertTrue(self.drv.set_buttons({4: "copy"}))
+        f = self.sent(0x08)[-1]
+        self.assertEqual(len(f), 59)
+        self.assertEqual(list(f[3 + 6 * 3:3 + 6 * 3 + 3]), [0x11, 0x01, 0x06])
+        self.assertEqual(list(f[57:59]), csum16(f, 3, 57))
 
-    def test_dpi_too_many_stages_raises(self):
-        data = {"dpi_stages": [800] * 9, "buttons": {}}
-        path = self._write_profile_file(data)
-        with self.assertRaises(ValueError):
-            self.pm.import_profile(path)
+    def test_battery_unknown_until_reported(self):
+        self.assertIsNone(self.drv.get_battery()["percentage"])
+        self.hw.input_queue.append(bytes([3, 0x10, 0x40, 0, 64]))
+        bat = self.drv.get_battery(poll_hardware=True)
+        self.assertEqual(bat["percentage"], 64)
+        self.assertEqual(self.sent(0x0C)[-1][0], 0x0C)
+        self.assertEqual(SkillkorpM20Driver().config["battery"], 64)  # persisted
 
+    def test_dpi_button_event_updates_active_stage(self):
+        self.hw.input_queue.append(bytes([3, 0, 0x10, 4, 0]))
+        self.drv.poll_status()
+        self.assertEqual(self.drv.config["active_stage"], 4)
 
-class TestDefaultProfilesHaveRGBFields(unittest.TestCase):
-    def test_all_defaults_have_light_fields(self):
-        required = {"light_mode", "brightness", "speed", "light_color"}
-        for prof_id, prof in DEFAULT_PROFILES_MOUSE.items():
-            for field in required:
-                self.assertIn(field, prof, f"DEFAULT_PROFILES_MOUSE['{prof_id}'] manque le champ '{field}'")
+    def test_listen_collects_events_without_query(self):
+        self.hw.input_queue += [bytes([3, 0, 0x20, 2, 0]), bytes([3, 0x10, 0x40, 2, 55])]
+        events = self.drv.listen(0.1)
+        self.assertEqual([e["type"] for e in events], ["dpi_stage", "battery"])
+        self.assertEqual(self.sent(0x0C), [])
+        self.assertTrue(self.drv.config["charging"])
 
-    def test_light_color_is_rgb_list(self):
-        for prof_id, prof in DEFAULT_PROFILES_MOUSE.items():
-            color = prof.get("light_color")
-            self.assertIsInstance(color, list, f"light_color de '{prof_id}' n'est pas une liste")
-            self.assertEqual(len(color), 3, f"light_color de '{prof_id}' n'a pas 3 composantes")
-            for c in color:
-                self.assertGreaterEqual(c, 0)
-                self.assertLessEqual(c, 255)
+    def test_apply_profile_sends_each_report_once(self):
+        prof = {"dpi_stages": [400, 800], "active_stage": 1, "polling_rate": 250, "light_mode": "neon",
+                "debounce": 6, "buttons": {"4": "copy"}}
+        self.assertTrue(self.drv.apply_profile(prof))
+        self.assertEqual(sorted(w[0] for w in self.hw.writes), [4, 5, 6, 8])
+        self.assertEqual(self.sent(0x05)[0][10], 6)
+        self.assertEqual(self.drv.config["buttons"]["4"], "copy")
 
-
-class TestReloadConfigIfChanged(unittest.TestCase):
-    """Tests du rechargement conditionnel de configuration multi-processus."""
-
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.config_path = os.path.join(self.temp_dir.name, "default.json")
-        self.initial_config = {
-            "polling_rate": 500, "dpi_stages": [800, 1600], "active_stage": 1,
-            "light_mode": "static", "brightness": 5, "speed": 3,
-            "light_color": [255, 0, 0], "sleep_timer_minutes": 5, "move_to_wake": True,
-            "buttons": {"1": "left_click"}, "battery": 80, "charging": False,
-        }
-        with open(self.config_path, "w") as f:
-            json.dump(self.initial_config, f)
-
-    def tearDown(self):
-        self.temp_dir.cleanup()
-
-    def test_reload_when_file_modified(self):
-        with patch("skillkorp.devices.mouse.DEFAULT_PROFILE_FILE", self.config_path):
-            with patch.object(SkillkorpM20Driver, "find_device", return_value=None):
-                driver = SkillkorpM20Driver()
-                self.assertEqual(driver.config.get("polling_rate"), 500)
-                self.assertFalse(driver.reload_config_if_changed())
-
-                updated_config = self.initial_config.copy()
-                updated_config["polling_rate"] = 1000
-                with open(self.config_path, "w") as f:
-                    json.dump(updated_config, f)
-                new_mtime = os.path.getmtime(self.config_path) + 10.0
-                os.utime(self.config_path, (new_mtime, new_mtime))
-
-                reloaded = driver.reload_config_if_changed()
-                self.assertTrue(reloaded)
-                self.assertEqual(driver.config.get("polling_rate"), 1000)
-
-    def test_reload_when_file_unchanged(self):
-        with patch("skillkorp.devices.mouse.DEFAULT_PROFILE_FILE", self.config_path):
-            with patch.object(SkillkorpM20Driver, "find_device", return_value=None):
-                driver = SkillkorpM20Driver()
-                self.assertFalse(driver.reload_config_if_changed())
-
-    def test_reload_when_file_missing(self):
-        missing_path = os.path.join(self.temp_dir.name, "nonexistent.json")
-        with patch("skillkorp.devices.mouse.DEFAULT_PROFILE_FILE", missing_path):
-            with patch.object(SkillkorpM20Driver, "find_device", return_value=None):
-                driver = SkillkorpM20Driver()
-                self.assertFalse(driver.reload_config_if_changed())
-
-    def test_query_status_triggers_reload(self):
-        with patch("skillkorp.devices.mouse.DEFAULT_PROFILE_FILE", self.config_path):
-            with patch.object(SkillkorpM20Driver, "find_device", return_value=None):
-                driver = SkillkorpM20Driver()
-                with patch.object(driver, "is_connected", return_value=False):
-                    status = driver.query_status()
-                    self.assertEqual(status["polling_rate_hz"], 500)
-
-                    updated_config = self.initial_config.copy()
-                    updated_config["polling_rate"] = 1000
-                    with open(self.config_path, "w") as f:
-                        json.dump(updated_config, f)
-                    new_mtime = os.path.getmtime(self.config_path) + 10.0
-                    os.utime(self.config_path, (new_mtime, new_mtime))
-
-                    status = driver.query_status()
-                    self.assertEqual(status["polling_rate_hz"], 1000)
+    def test_old_config_is_upgraded(self):
+        with open(ms.DEFAULT_PROFILE_FILE, "w") as f:
+            json.dump({"move_to_wake": True, "speed": 2, "dpi_stages": [400, 99999], "battery": 100}, f)
+        drv = SkillkorpM20Driver()
+        self.assertNotIn("move_to_wake", drv.config)
+        self.assertEqual(drv.config["speed"], 4)
+        self.assertEqual(drv.config["dpi_stages"], [400, 800, 1600, 3200, 6400, 26000])
+        self.assertIsNone(drv.config["battery"])  # 1.0.x fabricated 100 %
 
 
 if __name__ == "__main__":

@@ -6,10 +6,6 @@ __pycache__/
 # Test artifacts
 .pytest_cache/
 
-# Packaging build artifacts
-/dist/
-/build_rpm/
-/build_deb/
 
 # Editors
 .vscode/
@@ -18,3 +14,9 @@ __pycache__/
 
 # NOTE: never ignore .github/ here — an earlier skillkorp-k20 mistake did
 # that and it silently broke CI for a while. Keep this comment as a tripwire.
+
+# Packaging build artifacts
+/dist/
+
+# Hardware test reports (tools/hwtest.py)
+skillkorp-hwtest-*.txt

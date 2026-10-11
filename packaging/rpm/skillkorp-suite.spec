@@ -1,93 +1,126 @@
-%{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 %global pkgdir %{_datadir}/skillkorp-suite
+%{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
+%{!?_userunitdir: %global _userunitdir %{_prefix}/lib/systemd/user}
 
 Name:           skillkorp-suite
-Version:        1.0.1
-Release:        1%{?dist}
-Summary:        Pilote et interface graphique Linux unifiés pour le clavier SkillKorp K20 Ultimate et la souris SkillKorp M20 Ultimate
+Version:        @VERSION@
+Release:        @RELEASE@%{?dist}
+Summary:        Driver and settings tools for SkillKorp K20 keyboard and M20 mouse
 License:        MIT
 URL:            https://github.com/ElMajor76/skillkorp-suite
+Source0:        %{name}-%{version}.tar.gz
 BuildArch:      noarch
 
-Requires:       python3
+BuildRequires:  python3
+
+Requires:       python3 >= 3.10
+%if 0%{?suse_version}
 Requires:       python3-gobject
+Requires:       typelib(Gtk) = 4.0
+Requires:       typelib(Adw) = 1
+Requires:       udev
+Recommends:     typelib(Gtk) = 3.0
+Recommends:     typelib(AyatanaAppIndicator3) = 0.1
+Recommends:     typelib(Notify) = 0.7
+Recommends:     xdotool
+%else
+Requires:       python3-gobject
+Requires:       gtk4
 Requires:       libadwaita
 Requires:       systemd-udev
+Recommends:     gtk3
 Recommends:     libayatana-appindicator-gtk3
-Recommends:     libappindicator-gtk3
+Recommends:     libnotify
+Recommends:     xdotool
+%endif
 
 %description
-Pilote natif sous Linux, utilitaire CLI unifié (skillkorpctl), application
-GTK 4 / Libadwaita (skillkorp-gui) et applet systray unique (skillkorp-tray)
-pour le clavier gaming compact 75%% SkillKorp K20 Ultimate (SoC Yichip YC3121)
-et la souris gaming sans fil SkillKorp M20 Ultimate (capteur PixArt PAW3395).
-Remplace les projets séparés skillkorp-k20 et skillkorp-m20.
+Unofficial Linux driver, command line tool (skillkorpctl), GTK 4 / Libadwaita
+application (skillkorp-gui) and tray indicator (skillkorp-tray) for the
+SkillKorp K20 Ultimate keyboard and the SkillKorp M20 Ultimate mouse:
+lighting, polling rate, debounce, sleep timers, DPI stages, key and button
+remapping, profiles with per-application switching and battery levels.
 
 %prep
-# Pas d'étape de compilation requise
+%autosetup -n %{name}-%{version}
 
 %build
-# Scripts Python, rien à compiler
+# Pure Python: nothing to build.
+
+%check
+HOME="$PWD/.home" python3 -m unittest discover -s tests -t . -q
 
 %install
-rm -rf %{buildroot}
-mkdir -p %{buildroot}%{pkgdir}
-mkdir -p %{buildroot}%{_bindir}
-mkdir -p %{buildroot}%{_udevrulesdir}
-mkdir -p %{buildroot}%{_datadir}/applications
-mkdir -p %{buildroot}%{_datadir}/icons/hicolor/256x256/apps
-
-# Paquet Python "skillkorp" complet
-cp -r %{_sourcedir}/skillkorp %{buildroot}%{pkgdir}/skillkorp
-find %{buildroot}%{pkgdir}/skillkorp -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
-
-install -m 0755 %{_sourcedir}/bin/skillkorpctl %{buildroot}%{pkgdir}/skillkorpctl
-cp -r %{_sourcedir}/assets %{buildroot}%{pkgdir}/
-
-# Liens symboliques dans /usr/bin
-ln -s %{pkgdir}/skillkorpctl %{buildroot}%{_bindir}/skillkorpctl
-cat > %{buildroot}%{_bindir}/skillkorp-gui << EOF
-#!/bin/sh
-exec env PYTHONPATH="%{pkgdir}:\$PYTHONPATH" python3 -m skillkorp.gui "\$@"
-EOF
-chmod 0755 %{buildroot}%{_bindir}/skillkorp-gui
-cat > %{buildroot}%{_bindir}/skillkorp-tray << EOF
-#!/bin/sh
-exec env PYTHONPATH="%{pkgdir}:\$PYTHONPATH" python3 -m skillkorp.tray "\$@"
-EOF
-chmod 0755 %{buildroot}%{_bindir}/skillkorp-tray
-
-# Règle udev, lanceur .desktop et icône
-install -m 0644 %{_sourcedir}/udev/99-skillkorp-suite.rules %{buildroot}%{_udevrulesdir}/99-skillkorp-suite.rules
-install -m 0644 %{_sourcedir}/io.github.skillkorp.suite.desktop %{buildroot}%{_datadir}/applications/io.github.skillkorp.suite.desktop
-install -m 0644 %{_sourcedir}/assets/skillkorp-suite.png %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/skillkorp-suite.png
+python3 packaging/build_packages.py --install %{buildroot} --prefix %{_prefix}
+# Docs and licence are installed by %%doc / %%license below.
+rm -rf %{buildroot}%{_datadir}/doc/%{name} %{buildroot}%{_datadir}/licenses/%{name}
 
 %post
+rm -f %{_sysconfdir}/udev/rules.d/99-skillkorp-suite.rules
 udevadm control --reload-rules >/dev/null 2>&1 || :
-udevadm trigger --subsystem-match=hidraw >/dev/null 2>&1 || :
-update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
+udevadm trigger --subsystem-match=hidraw --action=change >/dev/null 2>&1 || :
+# 1.2: only the vendor interface stays open; drop the ACLs that older rules
+# gave on the keystroke/pointer interfaces (they would last until replug).
+# The uaccess tag stays in the udev database ("sticky") until the device is
+# removed, and logind re-applies the ACL from it: replay remove + add for
+# those interfaces so the database matches the new rule, then drop the ACL.
+stale=""
+for n in /sys/class/hidraw/hidraw*; do
+    m=$(cat "$n/device/../modalias" 2>/dev/null) || continue
+    case "$m" in
+        usb:v3151p401[15]*in02|usb:v1D57pFA6[01]*in02) ;;
+        usb:v3151p401[15]*|usb:v1D57pFA6[01]*)
+            if command -v udevadm >/dev/null 2>&1; then
+                udevadm trigger --action=remove "$n" 2>/dev/null || true
+                udevadm trigger --action=add "$n" 2>/dev/null || true
+            fi
+            stale="$stale /dev/${n##*/}" ;;
+    esac
+done
+if [ -n "$stale" ]; then
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=10 2>/dev/null || true
+    for d in $stale; do
+        command -v setfacl >/dev/null 2>&1 && setfacl -b "$d" 2>/dev/null || true
+    done
+fi
 
 %postun
 udevadm control --reload-rules >/dev/null 2>&1 || :
-udevadm trigger --subsystem-match=hidraw >/dev/null 2>&1 || :
-update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 
 %files
-%{pkgdir}
+%license LICENSE
+%doc README.md CHANGELOG.md AUDIT.md
 %{_bindir}/skillkorpctl
 %{_bindir}/skillkorp-gui
 %{_bindir}/skillkorp-tray
-%{_udevrulesdir}/99-skillkorp-suite.rules
+%{pkgdir}
+%config(noreplace) %{_sysconfdir}/xdg/autostart/io.github.skillkorp.suite.tray.desktop
+%{_udevrulesdir}/70-skillkorp-suite.rules
+%{_userunitdir}/skillkorp-daemon.service
 %{_datadir}/applications/io.github.skillkorp.suite.desktop
-%{_datadir}/icons/hicolor/256x256/apps/skillkorp-suite.png
+%{_datadir}/metainfo/io.github.skillkorp.suite.metainfo.xml
+%{_datadir}/icons/hicolor/512x512/apps/skillkorp-suite.png
+%{_datadir}/gnome-shell/extensions/skillkorp-focus@skillkorp.github.io
+%{_mandir}/man1/skillkorpctl.1*
+%{_mandir}/man1/skillkorp-gui.1*
+%{_mandir}/man1/skillkorp-tray.1*
 
 %changelog
+* Sun Oct 11 2026 nplacide <nplacide95@gmail.com> - 1.2.0-1
+- K20 over the 2.4 GHz receiver (receiver protocol captured from the vendor
+  software); settings for a sleeping keyboard applied when it wakes up
+- udev access limited to the vendor configuration interface
+- Tray started with the session and the GUI, its Quit closes both
+- Guided hardware test tool (tools/hwtest.py)
+
+* Sun Oct 11 2026 nplacide <nplacide95@gmail.com> - 1.1.0-1
+- Protocol fixes verified against the vendor software (keyboard multicolour
+  flag, key remap indices, option bits; mouse lighting/power/debounce report)
+- Robust hidraw transport, crash-safe configuration, non-blocking GUI and tray
+- udev rule renamed 70-skillkorp-suite.rules (uaccess ordering)
+
 * Sun Sep 20 2026 nplacide <nplacide95@gmail.com> - 1.0.1-1
-- Correction du protocole clavier K20 (checksums complément à un, codes de
-  commande et offsets de payload corrigés) : RGB, verrouillage Windows,
-  polling rate, debounce, veille et remapping de touches fonctionnent enfin
+- Keyboard protocol corrections (checksums, command codes)
 
 * Sun Sep 20 2026 nplacide <nplacide95@gmail.com> - 1.0.0-1
-- Fusion de skillkorp-k20 et skillkorp-m20 en une application unique
-- CLI unifiée skillkorpctl (sous-commandes keyboard/mouse), GUI et tray uniques
-- Migration automatique des profils existants au premier lancement
+- Merge of skillkorp-k20 and skillkorp-m20

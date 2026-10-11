@@ -1,109 +1,85 @@
-name: CI — Lint & Tests
+name: CI — Lint, tests & paquets
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
-  lint-and-test:
-    name: Lint (flake8) + Tests (pytest)
+  test:
+    name: Tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.13"]
     steps:
-      - name: Récupérer le code
-        uses: actions/checkout@v4
-
-      - name: Configurer Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
+      - name: Dépendances de test
+        run: python -m pip install --upgrade pip flake8
+      - name: Lint (erreurs bloquantes)
+        run: flake8 skillkorp bin/skillkorpctl tests packaging tools --count --select=E9,F63,F7,F82,F401,F811,F841 --show-source --statistics
+      - name: Style (informatif)
+        run: flake8 skillkorp bin/skillkorpctl --count --exit-zero --max-line-length=120 --statistics
+      - name: Tests unitaires
+        run: HOME="$RUNNER_TEMP/home" python -m unittest discover -s tests -t . -v
 
-      - name: Installer les dépendances de test
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest flake8
-
-      - name: Lint — flake8 (erreurs critiques uniquement)
-        run: |
-          # E9xx = erreurs de syntaxe/runtime, F63x/F7xx/F82x = bugs logiques
-          flake8 skillkorp bin/skillkorpctl \
-            --count --select=E9,F63,F7,F82 --show-source --statistics
-
-      - name: Style — flake8 (avertissements, non bloquant)
-        run: |
-          flake8 skillkorp bin/skillkorpctl \
-            --count --exit-zero --max-line-length=120 --statistics
-        continue-on-error: true
-
-      - name: Tests unitaires — pytest
-        run: |
-          python -m pytest tests/ -v --tb=short
-
-  smoke-test:
-    name: Smoke test — import des pilotes (sans GTK)
+  packages:
+    name: Paquets (deb, rpm, arch)
     runs-on: ubuntu-latest
-
+    needs: test
     steps:
-      - name: Récupérer le code
-        uses: actions/checkout@v4
-
-      - name: Configurer Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - name: Outils de construction
+        run: sudo apt-get update && sudo apt-get install -y rpm libarchive-tools zstd lintian
+      - name: Construction
+        run: python3 packaging/build_packages.py
+      - name: Lintian
+        run: lintian --no-tag-display-limit --suppress-tags no-manual-page,initial-upload-closes-no-bugs dist/*.deb || true
+      - name: Contrôle des paquets
+        run: |
+          dpkg-deb --info dist/*.deb
+          for f in dist/*.rpm; do rpm -qpl "$f" >/dev/null && rpm -qpR "$f"; done
+          tar -tf dist/*-any.pkg.tar.zst | head
+      - uses: actions/upload-artifact@v4
         with:
-          python-version: "3.11"
+          name: skillkorp-suite-packages
+          path: dist/
 
-      - name: Vérifier que skillkorp.devices.keyboard s'importe sans erreur
+  install-test:
+    name: Installation ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: packages
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            install: apt-get update && apt-get install -y ./dist/*.deb
+          - image: ubuntu:24.04
+            install: apt-get update && apt-get install -y ./dist/*.deb
+          - image: fedora:41
+            install: dnf install -y ./dist/*.fc.noarch.rpm
+          - image: opensuse/tumbleweed
+            install: zypper --non-interactive install --allow-unsigned-rpm ./dist/*.suse.noarch.rpm
+          - image: archlinux:latest
+            install: pacman -Syu --noconfirm && pacman -U --noconfirm ./dist/*-any.pkg.tar.zst
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: skillkorp-suite-packages
+          path: dist
+      - name: Installer le paquet
+        run: ${{ matrix.install }}
+      - name: Vérifier
         run: |
-          python -c "
-          from skillkorp.devices.keyboard import (
-              POLLING_RATE_MAP, LIGHT_MODES, SIDE_LIGHT_MODES, KEY_LAYOUT,
-              REMAP_ACTIONS, SkillkorpK20Driver, _HIDIOCSFEATURE, _HIDIOCGFEATURE
-          )
-          print(f'✓ skillkorp.devices.keyboard importé : {len(KEY_LAYOUT)} touches dans la matrice')
-          print(f'✓ {len(LIGHT_MODES)} modes RGB et {len(SIDE_LIGHT_MODES)} modes latéraux')
-          assert len(KEY_LAYOUT) == 85, 'Touches manquantes dans KEY_LAYOUT'
-          assert SkillkorpK20Driver.device_type == 'keyboard'
-          print('✓ Toutes les 85 touches sont présentes')
-          "
-
-      - name: Vérifier que skillkorp.devices.mouse s'importe sans erreur
-        run: |
-          python -c "
-          from skillkorp.devices.mouse import (
-              POLLING_RATE_MAP, LIGHT_MODES, BUTTON_ACTIONS,
-              PHYSICAL_BTN_TO_SLOT, SkillkorpM20Driver, _HIDIOCSFEATURE
-          )
-          print(f'✓ skillkorp.devices.mouse importé : {len(BUTTON_ACTIONS)} actions boutons')
-          print(f'✓ PHYSICAL_BTN_TO_SLOT : boutons {sorted(PHYSICAL_BTN_TO_SLOT.keys())}')
-          assert set(PHYSICAL_BTN_TO_SLOT.keys()) == {1,2,3,4,5,6}, 'Bouton 6 manquant!'
-          assert SkillkorpM20Driver.device_type == 'mouse'
-          print('✓ Tous les boutons 1-6 présents')
-          "
-
-      - name: Vérifier que skillkorp.profiles.manager s'importe sans erreur
-        run: |
-          python -c "
-          from skillkorp.profiles.manager import (
-              DEFAULT_PROFILES_KEYBOARD, DEFAULT_PROFILES_MOUSE,
-              is_autostart_enabled, set_autostart, ProfileManager,
-          )
-          print(f'✓ profile manager importé : {len(DEFAULT_PROFILES_KEYBOARD)} profils clavier, {len(DEFAULT_PROFILES_MOUSE)} profils souris')
-          required_kb = {'rgb', 'side_rgb', 'polling_rate', 'debounce_ms', 'sleep', 'options', 'key_remaps'}
-          for pid, p in DEFAULT_PROFILES_KEYBOARD.items():
-              missing = required_kb - set(p.keys())
-              assert not missing, f'Profil clavier {pid} manque: {missing}'
-          required_mouse = {'light_mode', 'brightness', 'speed', 'light_color'}
-          for pid, p in DEFAULT_PROFILES_MOUSE.items():
-              missing = required_mouse - set(p.keys())
-              assert not missing, f'Profil souris {pid} manque: {missing}'
-          print('✓ Tous les profils ont les champs requis')
-          "
-
-      - name: Vérifier que skillkorp.profiles.migration s'importe sans erreur
-        run: |
-          python -c "
-          from skillkorp.profiles.migration import migrate_legacy_configs
-          print('✓ skillkorp.profiles.migration importé')
-          "
+          skillkorpctl --version
+          skillkorpctl status --json
+          skillkorpctl doctor || true
+          python3 -I -c 'import sys; sys.path.insert(0, "/usr/share/skillkorp-suite"); import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); import skillkorp.gui'

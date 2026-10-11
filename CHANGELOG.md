@@ -3,6 +3,105 @@
 Toutes les modifications notables sont documentées dans ce fichier.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/).
 
+## [1.2.0] — 2026-10-11
+
+Validée sur le matériel (K20 en 2.4 GHz et en filaire, M20 par récepteur).
+
+### Sécurité
+- La règle udev n'ouvre plus que l'**interface de configuration** (interface
+  USB 2) de chaque appareil : les interfaces qui transportent les frappes du
+  clavier et les mouvements de la souris ne sont plus lisibles par les
+  programmes de la session. Les droits accordés par l'ancienne règle sont
+  retirés à l'installation (y compris l'étiquette « uaccess » qu'udev garde
+  en mémoire jusqu'au débranchement) ; `skillkorpctl doctor` signale toute
+  interface de saisie encore exposée.
+
+### Corrigé — clavier K20
+- **Le clavier ne réagissait à aucune commande via son récepteur 2.4 GHz.**
+  Protocole du récepteur reproduit d'après une capture USB du logiciel
+  officiel (initialisation `FE 40`/`F6 0A`, état `F7`, récupération des
+  réponses par `FC`) : réglages et lectures fonctionnent sans fil, une
+  réponse restée en attente (qui bloquait le récepteur) est récupérée avant
+  chaque envoi. Batterie lue sur le récepteur.
+- Réglages du clavier en 2.4 GHz fiables : le récepteur ne garde qu'une
+  trame à la fois, et une trame envoyée avant que la précédente soit
+  transmise l'effaçait sans erreur. Le pilote attend la transmission (octet
+  5 de l'état `F7`), puis relit chaque réglage et le renvoie si besoin
+  (mis en évidence par `tools/hwtest.py`).
+
+### Ajouté
+- Réglages du clavier envoyés pendant sa veille : enregistrés puis appliqués
+  automatiquement à son réveil (indicateur, application, ou
+  `skillkorpctl keyboard sync`), au lieu d'échouer.
+- Indicateur : seul le logo s'affiche dans la barre, les batteries sont dans
+  son menu avec les icônes clavier et souris du thème système ; il démarre
+  avec la session (`/etc/xdg/autostart`, désactivable par utilisateur) et
+  avec l'application ; son bouton « Quitter » ferme aussi l'application.
+- Application : icônes du thème système (appareils, niveau de batterie) à la
+  place des émojis.
+- Bascule automatique des profils sous **GNOME Wayland** : extension GNOME
+  Shell `skillkorp-focus@skillkorp.github.io` (GNOME 45 à 50), installée
+  avec le paquet et activée avec la bascule ; elle ne transmet que
+  l'identifiant de l'application au premier plan.
+- Commande `skillkorpctl mouse battery`, pendant de `keyboard battery`.
+- Charge par câble affichée : clavier et souris branchés en USB indiqués
+  « En charge (câble USB) », avec l'icône de batterie en charge du thème ;
+  état d'alimentation de la souris lu dans son rapport batterie (attendu
+  jusqu'à 2,5 s).
+- Souris : chaque écriture est vérifiée par l'accusé du récepteur
+  (`03 10 50 00`) et renvoyée jusqu'à 4 fois (une souris au repos perd
+  parfois plusieurs trames d'affilée) ; réglages d'éclairage,
+  absents de la M20 Ultimate, retirés de l'interface.
+- Outils : `tools/usbcapture.py` (capture usbmon des échanges de
+  configuration, sans enregistrer les frappes) et `tools/hwtest.py` (test
+  matériel guidé, chaque réglage restauré après son test).
+
+## [1.1.0] — 2026-10-11
+
+Audit complet et fiabilisation ; détail et preuves dans [AUDIT.md](AUDIT.md).
+Les corrections de protocole ont été vérifiées contre les logiciels officiels
+(KU_SkillKorp Driver 2.1.78 et MU_SkillKorp.exe).
+
+### Corrigé — clavier K20
+- Flag multicolore (« dazzle ») inversé : une couleur choisie donnait un effet
+  arc-en-ciel, et la GUI renvoyait du rouge à chaque réglage.
+- Remappage envoyé sur la mauvaise touche (index de la disposition au lieu de
+  l'index de la matrice du firmware).
+- Les options (verrouillage Windows, ZQSD, mode gaming) écrasaient les autres
+  bits du firmware : lecture-modification-écriture.
+- Bornes de veille du K20 (1–60 min / 10–60 min, 0 = jamais), octet de profil
+  retiré de l'anti-rebond, vitesse des bandes latérales, délais entre commandes.
+
+### Corrigé — souris M20
+- Rapport 0x05 refait d'après le logiciel officiel : l'anti-rebond n'était
+  jamais envoyé et l'octet correspondant recevait « réveil au mouvement ».
+- Modes d'éclairage décalés d'un cran (« Fixe » envoyait « Respiration »).
+- Vitesse, luminosité et minuterie de veille mal encodées ; nouveau réglage
+  « extinction des LED » ; option « réveil au mouvement » retirée (absente
+  sur la M20).
+- Rapports dimensionnés selon le descripteur HID ; lecture batterie fiable.
+
+### Corrigé — logiciel
+- GUI et tray ne se figent plus (E/S en arrière-plan), erreurs affichées,
+  curseurs anti-rafale, titres contenant « & » affichés.
+- Codes de retour honnêtes dans la CLI ; plus de traces Python sur une saisie
+  invalide.
+- Configuration écrite de façon atomique et verrouillée entre processus ;
+  fichiers corrompus mis de côté au lieu d'être écrasés.
+- Raccourcis Ctrl+Z / Ctrl+A corrigés pour l'AZERTY (envoyaient Ctrl+W / Ctrl+Q).
+- Règle udev renommée `70-skillkorp-suite.rules` (le tag `uaccess` était posé
+  trop tard) ; lanceurs en mode Python isolé.
+
+### Ajouté
+- `skillkorpctl doctor`, `mouse light`, `keyboard info`, `keyboard apply`,
+  `profile apps|auto`, `remap --list`, actions `default` (restaurer une touche).
+- Bascule automatique avec retour au profil précédent, détection KDE.
+- GUI : éclairage souris, multicolore clavier, couche Fn, liste des remappages,
+  sélecteurs de fichiers, compatibilité libadwaita 1.2+.
+- Paquets .deb, .rpm (Fedora/RHEL, openSUSE), Arch ; AppStream ; service
+  utilisateur `skillkorp-daemon.service`.
+- 88 tests unitaires sur un faux périphérique HID + test de bout en bout GUI.
+
 ## [1.0.1] — 2026-09-20
 
 ### Correction du protocole clavier K20 (RGB, verrouillage, remapping...)
