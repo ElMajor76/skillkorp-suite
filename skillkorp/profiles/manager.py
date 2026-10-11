@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from skillkorp import config_store
@@ -703,8 +704,31 @@ def _run(cmd: List[str], timeout: float = 0.4) -> Optional[str]:
         return None
 
 
+GNOME_FOCUS_EXTENSION = "skillkorp-focus@skillkorp.github.io"
+
+
+def _is_gnome_session() -> bool:
+    return "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
+
+
+def _query_gnome_focus() -> Optional[Tuple[str, str]]:
+    """(wm_class, app_id) of the focused window from the SkillKorp GNOME
+    Shell extension, or None when the extension is not running."""
+    out = _run(["gdbus", "call", "--session", "--dest", "org.gnome.Shell",
+                "--object-path", "/io/github/skillkorp/Focus",
+                "--method", "io.github.skillkorp.Focus.GetFocused"])
+    if not out:
+        return None
+    m = re.fullmatch(r"\('((?:[^'\\]|\\.)*)', '((?:[^'\\]|\\.)*)'\)", out)
+    return (m.group(1), m.group(2)) if m else None
+
+
 def _detect_gnome() -> Optional[str]:
-    # Works with the "Window Calls"/"Focused Window D-Bus" extensions when present.
+    focus = _query_gnome_focus()
+    if focus is not None:
+        wm_class, app_id = focus
+        return wm_class or app_id or None
+    # Third-party "Focused Window D-Bus" extension, when installed instead.
     out = _run(["gdbus", "call", "--session", "--dest", "org.gnome.Shell",
                 "--object-path", "/org/gnome/shell/extensions/FocusedWindow",
                 "--method", "org.gnome.shell.extensions.FocusedWindow.Get"])
@@ -715,6 +739,57 @@ def _detect_gnome() -> Optional[str]:
     return None
 
 
+def _gnome_extension_dirs() -> List[str]:
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    data_dirs = (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    return [os.path.join(d, "gnome-shell", "extensions") for d in [data_home] + data_dirs if d]
+
+
+def _gnome_enabled_extensions() -> Optional[List[str]]:
+    out = _run(["gsettings", "get", "org.gnome.shell", "enabled-extensions"], timeout=2)
+    if out is None:
+        return None
+    return re.findall(r"'([^']+)'", out)
+
+
+def gnome_focus_extension_status() -> Optional[str]:
+    """None outside GNOME, else "active", "inactive" (enabled, loaded at the
+    next login), "disabled" or "missing" (not installed)."""
+    if not _is_gnome_session():
+        return None
+    if _query_gnome_focus() is not None:
+        return "active"
+    if not any(os.path.isdir(os.path.join(d, GNOME_FOCUS_EXTENSION)) for d in _gnome_extension_dirs()):
+        return "missing"
+    enabled = _gnome_enabled_extensions() or []
+    return "inactive" if GNOME_FOCUS_EXTENSION in enabled else "disabled"
+
+
+def enable_gnome_focus_extension() -> Optional[str]:
+    """Enable the SkillKorp focus extension for this user when it is installed
+    but disabled (GNOME only). Returns the resulting status."""
+    status = gnome_focus_extension_status()
+    if status != "disabled":
+        return status
+    # Loaded at once when the running shell already knows the extension
+    # (asked directly: the gnome-extensions tool may go through a service
+    # that is not always available)...
+    out = _run(["gdbus", "call", "--session", "--dest", "org.gnome.Shell", "--object-path", "/org/gnome/Shell",
+                "--method", "org.gnome.Shell.Extensions.EnableExtension", GNOME_FOCUS_EXTENSION], timeout=3)
+    if out and "true" in out:
+        for _ in range(10):
+            status = gnome_focus_extension_status()
+            if status == "active":
+                return status
+            time.sleep(0.1)
+    # ...otherwise (installed after login) it is loaded at the next login.
+    enabled = _gnome_enabled_extensions()
+    if enabled is not None and GNOME_FOCUS_EXTENSION not in enabled:
+        value = "[" + ", ".join(f"'{e}'" for e in enabled + [GNOME_FOCUS_EXTENSION]) + "]"
+        _run(["gsettings", "set", "org.gnome.shell", "enabled-extensions", value], timeout=2)
+    return gnome_focus_extension_status()
+
+
 def _detect_kde() -> Optional[str]:
     out = _run(["kdotool", "getactivewindow", "getwindowclassname"])
     return out or None
@@ -722,6 +797,12 @@ def _detect_kde() -> Optional[str]:
 
 def detect_active_window_class() -> Optional[str]:
     """Detect the focused window's class/app id (X11, XWayland, Hyprland, Sway, KDE, GNOME)."""
+    # Under GNOME Wayland the X11 tools only see XWayland windows (and report
+    # a stale one when a native window has the focus): ask the shell first.
+    if _is_gnome_session() and os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        res = _detect_gnome()
+        if res:
+            return res.lower()
     out = _run(["xdotool", "getactivewindow", "getwindowclassname"], timeout=0.3)
     if out:
         return out.lower()

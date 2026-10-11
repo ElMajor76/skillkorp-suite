@@ -143,6 +143,7 @@ uninstall() {
                "/usr/lib/udev/rules.d/$OLD_RULE" "/etc/udev/rules.d/$OLD_RULE"
     $SUDO rm -f /usr/lib/systemd/user/skillkorp-daemon.service
     $SUDO rm -f /etc/xdg/autostart/io.github.skillkorp.suite.tray.desktop
+    $SUDO rm -rf /usr/share/gnome-shell/extensions/skillkorp-focus@skillkorp.github.io
     $SUDO rm -f /usr/share/applications/io.github.skillkorp.suite.desktop \
                /usr/share/metainfo/io.github.skillkorp.suite.metainfo.xml \
                /usr/share/icons/hicolor/512x512/apps/skillkorp-suite.png \
@@ -151,6 +152,7 @@ uninstall() {
 
     rm -rf "$HOME/.local/share/$PKG_NAME" "$HOME/.local/share/doc/$PKG_NAME" "$HOME/.local/share/licenses/$PKG_NAME"
     rm -f "$HOME/.local/bin/skillkorpctl" "$HOME/.local/bin/skillkorp-gui" "$HOME/.local/bin/skillkorp-tray"
+    rm -rf "$HOME/.local/share/gnome-shell/extensions/skillkorp-focus@skillkorp.github.io"
     rm -f "$HOME/.local/share/applications/io.github.skillkorp.suite.desktop" \
           "$HOME/.local/share/metainfo/io.github.skillkorp.suite.metainfo.xml" \
           "$HOME/.local/share/icons/hicolor/512x512/apps/skillkorp-suite.png" \

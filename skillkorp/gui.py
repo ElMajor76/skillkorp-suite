@@ -35,7 +35,10 @@ from skillkorp.devices import mouse as msmod  # noqa: E402
 from skillkorp.devices.hidraw import DeviceError, DeviceNotFoundError, DevicePermissionError  # noqa: E402
 from skillkorp.devices.keyboard import SkillkorpK20Driver  # noqa: E402
 from skillkorp.devices.mouse import SkillkorpM20Driver  # noqa: E402
-from skillkorp.profiles.manager import ProfileManager, is_autostart_enabled, set_autostart  # noqa: E402
+from skillkorp.profiles.manager import (  # noqa: E402
+    ProfileManager, enable_gnome_focus_extension, gnome_focus_extension_status, is_autostart_enabled,
+    set_autostart,
+)
 from skillkorp.profiles.migration import migrate_legacy_configs  # noqa: E402
 from skillkorp import traylaunch  # noqa: E402
 from skillkorp.worker import DeviceWorker  # noqa: E402
@@ -383,7 +386,26 @@ def prefs_page(title: str, icon: str) -> Adw.PreferencesPage:
 # Generic profile page (used for both devices)
 # =============================================================================
 
+FOCUS_STATUS_TEXT = {
+    "inactive": "Extension GNOME SkillKorp activée : elle sera chargée à votre prochaine connexion "
+                "(déconnectez-vous puis reconnectez-vous).",
+    "disabled": "Extension GNOME SkillKorp désactivée : réactivez la bascule pour l'activer.",
+    "missing": "Sous GNOME, la bascule a besoin de l'extension SkillKorp, installée avec le paquet "
+               "(réinstallez-le si elle manque).",
+}
+
+
 class ProfilesPage:
+    def _on_auto_switch_toggled(self, enabled: bool):
+        self.pm.set_auto_switch_enabled(enabled)
+        self._show_focus_status(enable_gnome_focus_extension() if enabled else None)
+
+    def _show_focus_status(self, status: Optional[str]):
+        text = FOCUS_STATUS_TEXT.get(status or "")
+        self.auto_status.set_visible(bool(text))
+        if text:
+            self.auto_status.set_label(text)
+
     def __init__(self, win: "SkillkorpSuiteWindow", device: str, pm: ProfileManager, driver, worker: DeviceWorker,
                  on_switched: Callable[[], None]):
         self.win, self.device, self.pm, self.driver, self.worker = win, device, pm, driver, worker
@@ -419,8 +441,11 @@ class ProfilesPage:
             description="Bascule selon l'application au premier plan (via l'indicateur ou « skillkorpctl daemon ») ; "
                         "le profil précédent est rétabli quand l'application n'est plus active.")
         self.auto_toggle = Toggle("Bascule automatique des profils")
-        self.auto_toggle.on_change(lambda v: self.pm.set_auto_switch_enabled(v))
+        self.auto_toggle.on_change(self._on_auto_switch_toggled)
         auto_group.add(self.auto_toggle.row)
+        self.auto_status = Gtk.Label(xalign=0, wrap=True, visible=False, margin_top=6)
+        self.auto_status.add_css_class("dim-label")
+        auto_group.add(self.auto_status)
         self.autostart_toggle = Toggle("Démarrer l'indicateur avec la session",
                                        "Indicateur unique clavier + souris dans la barre système")
         self.autostart_toggle.on_change(self._toggle_autostart)
@@ -441,6 +466,7 @@ class ProfilesPage:
         prof = next((p for p in profiles if p["id"] == active), None)
         self.apps_row.set_text(", ".join(prof.get("auto_switch_apps", [])) if prof else "")
         self.auto_toggle.set(self.pm.is_auto_switch_enabled())
+        self._show_focus_status(gnome_focus_extension_status() if self.pm.is_auto_switch_enabled() else None)
         self.autostart_toggle.set(is_autostart_enabled())
         for r in self.rows:
             self.list_group.remove(r)

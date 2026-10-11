@@ -149,6 +149,14 @@ Chaque profil liste ses applications (`auto_switch_apps`). Quand l'une d'elles
 passe au premier plan, son profil est appliqué ; le profil précédent revient
 ensuite. N'activez pas le service et la bascule du tray en même temps.
 
+Détection de l'application au premier plan : `xdotool` (X11), Hyprland,
+Sway, `kdotool` (KDE) et, **sous GNOME Wayland**, l'extension GNOME Shell
+`skillkorp-focus@skillkorp.github.io` installée avec le paquet. Elle ne
+transmet que l'identifiant de l'application (jamais le titre ni le contenu
+des fenêtres) et est activée automatiquement avec la bascule ; si le paquet
+a été installé pendant la session, elle est chargée à la connexion
+suivante. `skillkorpctl doctor` indique son état.
+
 ---
 
 ## 📁 Configuration

@@ -100,6 +100,7 @@ udevadm control --reload-rules >/dev/null 2>&1 || :
 %{_datadir}/applications/io.github.skillkorp.suite.desktop
 %{_datadir}/metainfo/io.github.skillkorp.suite.metainfo.xml
 %{_datadir}/icons/hicolor/512x512/apps/skillkorp-suite.png
+%{_datadir}/gnome-shell/extensions/skillkorp-focus@skillkorp.github.io
 %{_mandir}/man1/skillkorpctl.1*
 %{_mandir}/man1/skillkorp-gui.1*
 %{_mandir}/man1/skillkorp-tray.1*

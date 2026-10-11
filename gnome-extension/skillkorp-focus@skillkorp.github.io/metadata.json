@@ -1,0 +1,7 @@
+{
+  "uuid": "skillkorp-focus@skillkorp.github.io",
+  "name": "SkillKorp Suite — application active",
+  "description": "Indique à SkillKorp Suite quelle application est au premier plan, pour la bascule automatique des profils du clavier K20 et de la souris M20 sous Wayland. Seul l'identifiant de l'application est transmis (jamais le titre ni le contenu des fenêtres).",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/ElMajor76/skillkorp-suite"
+}

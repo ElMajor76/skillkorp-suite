@@ -39,6 +39,10 @@ Validée sur le matériel (K20 en 2.4 GHz et en filaire, M20 par récepteur).
   avec l'application ; son bouton « Quitter » ferme aussi l'application.
 - Application : icônes du thème système (appareils, niveau de batterie) à la
   place des émojis.
+- Bascule automatique des profils sous **GNOME Wayland** : extension GNOME
+  Shell `skillkorp-focus@skillkorp.github.io` (GNOME 45 à 50), installée
+  avec le paquet et activée avec la bascule ; elle ne transmet que
+  l'identifiant de l'application au premier plan.
 - Commande `skillkorpctl mouse battery`, pendant de `keyboard battery`.
 - Charge par câble affichée : clavier et souris branchés en USB indiqués
   « En charge (câble USB) », avec l'icône de batterie en charge du thème ;

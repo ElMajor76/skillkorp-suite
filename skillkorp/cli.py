@@ -46,6 +46,8 @@ from skillkorp.profiles.manager import (
     AutoSwitcher,
     ProfileManager,
     detect_active_window_class,
+    enable_gnome_focus_extension,
+    gnome_focus_extension_status,
     is_autostart_enabled,
     set_autostart,
 )
@@ -443,6 +445,9 @@ def cmd_profile(device: str, driver, args):
         else:
             pm.set_auto_switch_enabled(args.state == "on")
             ok(f"Bascule automatique {'activée' if args.state == 'on' else 'désactivée'}.")
+            if args.state == "on" and enable_gnome_focus_extension() == "inactive":
+                print(f"{YELLOW}⚠ Extension GNOME SkillKorp activée : elle sera chargée à votre prochaine "
+                      f"connexion (déconnectez-vous puis reconnectez-vous).{RESET}")
 
 
 # =============================================================================
@@ -828,9 +833,23 @@ def cmd_doctor(args):
               f"Débranchez puis rebranchez le récepteur (ou redémarrez) pour appliquer la règle udev.{RESET}")
     else:
         ok("Seule l'interface de configuration est accessible (frappes protégées)")
+    focus_ext = gnome_focus_extension_status()
+    if focus_ext == "active":
+        ok("Extension GNOME SkillKorp active (application au premier plan)")
+    elif focus_ext == "inactive":
+        print(f"{YELLOW}⚠ Extension GNOME SkillKorp activée mais pas encore chargée : déconnectez-vous puis "
+              f"reconnectez-vous.{RESET}")
+    elif focus_ext == "disabled":
+        print(f"{YELLOW}⚠ Extension GNOME SkillKorp désactivée : « skillkorpctl profile auto on » "
+              f"l'active.{RESET}")
+    elif focus_ext == "missing" and os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        print(f"{YELLOW}⚠ Extension GNOME SkillKorp absente : réinstallez le paquet (bascule automatique "
+              f"impossible sous GNOME Wayland sans elle).{RESET}")
     cls = detect_active_window_class()
     if cls:
         ok(f"Détection de la fenêtre active : OK ({cls})")
+    elif focus_ext in ("inactive", "disabled", "missing"):
+        pass  # already explained above
     else:
         print(f"{YELLOW}⚠ Fenêtre active non détectable : installez xdotool (X11), ou utilisez Hyprland/Sway/"
               f"kdotool (KDE). La bascule automatique de profils sera inactive.{RESET}")

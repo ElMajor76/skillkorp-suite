@@ -315,3 +315,71 @@ class TestAutostartAndTray(unittest.TestCase):
                             "packaging", "common", "io.github.skillkorp.suite.tray.desktop")
         with open(path, encoding="utf-8") as f:
             self.assertEqual(f.read(), self.pm.AUTOSTART_ENTRY)
+
+
+class TestGnomeFocusExtension(unittest.TestCase):
+    """Client side of gnome-extension/skillkorp-focus@skillkorp.github.io."""
+
+    def setUp(self):
+        import skillkorp.profiles.manager as pm
+        from unittest.mock import patch
+        self.pm = pm
+        self.tmp = tempfile.mkdtemp()
+        self.calls = []
+        self.focus = None          # gdbus answer of GetFocused, None = extension not running
+        self.enabled = []          # org.gnome.shell enabled-extensions
+        self.shell_knows = True    # EnableExtension succeeds
+
+        def run(cmd, timeout=0.4):
+            self.calls.append(cmd)
+            if cmd[:2] == ["gdbus", "call"] and "io.github.skillkorp.Focus.GetFocused" in cmd:
+                return self.focus
+            if "org.gnome.Shell.Extensions.EnableExtension" in cmd:
+                if self.shell_knows:
+                    self.focus = "('', '')"
+                return "(true,)" if self.shell_knows else "(false,)"
+            if cmd[:3] == ["gsettings", "get", "org.gnome.shell"]:
+                return "[" + ", ".join(f"'{e}'" for e in self.enabled) + "]" if self.enabled else "@as []"
+            if cmd[:3] == ["gsettings", "set", "org.gnome.shell"]:
+                import re
+                self.enabled = re.findall(r"'([^']+)'", cmd[4])
+                return ""
+            return None
+        self._patches = [patch.object(pm, "_run", run),
+                         patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "ubuntu:GNOME", "XDG_SESSION_TYPE": "wayland",
+                                                 "XDG_DATA_HOME": self.tmp, "XDG_DATA_DIRS": self.tmp})]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def install(self):
+        os.makedirs(os.path.join(self.tmp, "gnome-shell", "extensions", self.pm.GNOME_FOCUS_EXTENSION))
+
+    def test_focused_application_parsed(self):
+        self.focus = "('org.gnome.Calculator', 'org.gnome.Calculator')"
+        self.assertEqual(self.pm.detect_active_window_class(), "org.gnome.calculator")
+        self.focus = "('', 'org.mozilla.firefox')"
+        self.assertEqual(self.pm.detect_active_window_class(), "org.mozilla.firefox")
+
+    def test_status_and_enabling_in_a_running_shell(self):
+        self.assertEqual(self.pm.gnome_focus_extension_status(), "missing")
+        self.install()
+        self.assertEqual(self.pm.gnome_focus_extension_status(), "disabled")
+        self.assertEqual(self.pm.enable_gnome_focus_extension(), "active")
+
+    def test_installed_after_login_is_enabled_for_next_login(self):
+        self.install()
+        self.shell_knows = False
+        self.enabled = ["other@ext"]
+        self.assertEqual(self.pm.enable_gnome_focus_extension(), "inactive")
+        self.assertEqual(self.enabled, ["other@ext", self.pm.GNOME_FOCUS_EXTENSION])
+
+    def test_outside_gnome_nothing_happens(self):
+        with __import__("unittest.mock").mock.patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "KDE"}):
+            self.assertIsNone(self.pm.enable_gnome_focus_extension())
+        self.assertFalse(any("gsettings" in c for c in self.calls))

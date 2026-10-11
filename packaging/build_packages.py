@@ -86,6 +86,7 @@ def _copy(src: str, dst: str, mode: int = 0o644):
 
 
 AUTOSTART_NAME = "io.github.skillkorp.suite.tray.desktop"
+GNOME_EXTENSION = "skillkorp-focus@skillkorp.github.io"
 CONFFILES = ["/etc/xdg/autostart/" + AUTOSTART_NAME]
 
 
@@ -121,6 +122,10 @@ def stage_tree(root: str, prefix: str = "/usr", system: bool = True) -> None:
           os.path.join(base, "share", "metainfo", "io.github.skillkorp.suite.metainfo.xml"))
     _copy(os.path.join(REPO_DIR, "assets", "skillkorp-suite.png"),
           os.path.join(base, "share", "icons", "hicolor", "512x512", "apps", "skillkorp-suite.png"))
+    # GNOME Shell extension giving the focused application (Wayland auto-switch).
+    ext_src = os.path.join(REPO_DIR, "gnome-extension", GNOME_EXTENSION)
+    for fn in sorted(os.listdir(ext_src)):
+        _copy(os.path.join(ext_src, fn), os.path.join(base, "share", "gnome-shell", "extensions", GNOME_EXTENSION, fn))
     _copy(os.path.join(REPO_DIR, "LICENSE"), os.path.join(base, "share", "licenses", PKG_NAME, "LICENSE"))
     _copy(os.path.join(REPO_DIR, "README.md"), os.path.join(base, "share", "doc", PKG_NAME, "README.md"))
     _copy(os.path.join(REPO_DIR, "CHANGELOG.md"), os.path.join(base, "share", "doc", PKG_NAME, "CHANGELOG.md"))
@@ -178,7 +183,7 @@ def _walk_sorted(root: str):
 # Source tarball (also the RPM/Arch source)
 # =============================================================================
 
-SOURCE_ITEMS = ["skillkorp", "bin", "assets", "udev", "packaging", "tests", "tools", "install.sh", "LICENSE", "README.md",
+SOURCE_ITEMS = ["skillkorp", "bin", "assets", "udev", "packaging", "tests", "tools", "gnome-extension", "install.sh", "LICENSE", "README.md",
                 "CHANGELOG.md", "AUDIT.md", "io.github.skillkorp.suite.desktop", "requirements-dev.txt"]
 
 

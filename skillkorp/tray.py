@@ -52,6 +52,8 @@ from skillkorp.devices.mouse import SkillkorpM20Driver  # noqa: E402
 from skillkorp.profiles.manager import (  # noqa: E402
     AutoSwitcher,
     ProfileManager,
+    enable_gnome_focus_extension,
+    gnome_focus_extension_status,
     is_autostart_enabled,
     set_autostart,
 )
@@ -101,6 +103,8 @@ class SkillkorpSuiteTray:
         self.indicator.set_menu(self.menu)
 
         self._poll(force_battery=True)
+        if self.kb_pm.is_auto_switch_enabled() or self.mouse_pm.is_auto_switch_enabled():
+            self._ensure_focus_extension()
         GLib.timeout_add_seconds(STATUS_PERIOD_S, self._on_status_timer)
         GLib.timeout_add(AUTOSWITCH_PERIOD_MS, self._on_auto_switch_timer)
 
@@ -275,6 +279,22 @@ class SkillkorpSuiteTray:
     def _on_toggle_autoswitch(self, item):
         for pm in (self.kb_pm, self.mouse_pm):
             pm.set_auto_switch_enabled(item.get_active())
+        if item.get_active():
+            self._ensure_focus_extension()
+
+    def _ensure_focus_extension(self):
+        """GNOME: enable the SkillKorp focus extension needed by the automatic
+        profile switching, and say so when a new login is required."""
+        def task():
+            return gnome_focus_extension_status(), enable_gnome_focus_extension()
+
+        def done(result):
+            before, after = result
+            if before == "disabled" and after == "inactive":
+                self._notify("Bascule automatique des profils",
+                             "Extension GNOME SkillKorp activée : elle sera chargée à votre prochaine "
+                             "connexion (déconnectez-vous puis reconnectez-vous).")
+        self.switch_worker.submit(task, done, lambda e: None)
 
     def _quit_all(self):
         """Quit the tray and the SkillKorp Suite window if it is open."""
