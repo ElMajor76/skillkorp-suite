@@ -68,7 +68,7 @@ jobs:
           - image: opensuse/tumbleweed
             install: zypper --non-interactive install --allow-unsigned-rpm ./dist/*.suse.noarch.rpm
           - image: archlinux:latest
-            install: pacman -Sy --noconfirm && pacman -U --noconfirm ./dist/*-any.pkg.tar.zst
+            install: pacman -Syu --noconfirm && pacman -U --noconfirm ./dist/*-any.pkg.tar.zst
     container: ${{ matrix.image }}
     steps:
       - uses: actions/download-artifact@v4
