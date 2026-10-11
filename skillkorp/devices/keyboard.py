@@ -1,46 +1,49 @@
 #!/usr/bin/env python3
 """
 SkillKorp K20 Ultimate - Linux Hardware Driver & Controller
-Reverse-engineered from ClavierK20Ultimate.exe (Yichip YC3121 SoC / CX71D Board)
 
-Supports:
-- 2.4GHz Wireless Dongle (3151:4011) and USB Wired Mode (3151:4015)
-- Interface 2 (Vendor Usage Page 0xFFFF, Usage 0x0002) 64-byte HID Feature Reports
-- Real-time battery status querying & charging state detection
-- RGB Backlight configuration (10 effects, speed 1-5, brightness 0-4, direction, custom RGB color)
-- Side RGB lighting (effects, speed, brightness, color)
-- Polling rate control (125 Hz, 250 Hz, 500 Hz, 1000 Hz)
-- Debounce time (2 ms - 20 ms)
-- Power management & sleep timeouts (light sleep and deep sleep)
-- Keyboard options: Windows Key Lock, WASD <-> Arrow keys swap, OS mode, Gaming mode
-- Key remapping (75% AZERTY French layout, standard keys & Fn layer)
-- Hardware profile selection (profiles 0, 1, 2)
-- Factory reset
+Protocol reference: the official "KU_SkillKorp Driver" 2.1.78 (Electron UI +
+iot_driver.exe). The K20 is device "yc3121_cx71d_soc" (VID 0x3151, PID 0x4011
+for the 2.4GHz receiver, 0x4015 wired), handled by the vendor's YC3121 class
+hierarchy. Every frame below was checked against that code; see AUDIT.md.
 
-Ported into SkillKorp Suite from the standalone skillkorp-k20 project. This
-driver had already been through several audit passes there (byte-offset
-fixes for set_sleep_time/remap_key/remap_fn_key, full 5-byte interface
-descriptor detection, and an honest None battery fallback instead of a
-fabricated value) - all of that hardware behavior is preserved unchanged.
+Transport: interface 2 (Usage Page 0xFFFF, Usage 0x0002), a single 64-byte
+feature report without report ID. byte[0] is the command, then:
+  - "BIT7" checksum: payload[7] = ~sum(payload[0:7]) (most commands),
+  - "BIT8" checksum: payload[8] = ~sum(payload[0:8]) (LED commands).
+On the 2.4GHz receiver frames are sent unchanged; the receiver has its own
+commands (0xF7 status, 0xFC fetch answer, 0xFE/0xF6 init) used around them,
+as captured from the vendor software (see SkillkorpK20Driver._rf_prepare).
+
+Features: RGB backlight & side LEDs (incl. multicolour "dazzle" flag), polling
+rate, debounce, light/deep sleep, Win-lock / WASD swap / gaming mode / OS mode
+(read-modify-write, unknown option bits preserved), hardware profile, single
+key remapping on the base and Fn layers (correct matrix indices, restorable
+to factory), factory reset, firmware version and battery query.
 """
 
 import os
-import sys
-import glob
-import fcntl
-import json
 import time
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from .base import SkillkorpDeviceDriver
+from . import hidraw
+from .hidraw import DeviceBusyError, DeviceError, DeviceNotFoundError, DevicePermissionError, HidrawNode
+
+
+
+class KeyboardOfflineError(DeviceError):
+    """The 2.4GHz receiver reports the keyboard off or asleep."""
+
 
 CONFIG_DIR = os.path.expanduser("~/.config/skillkorp/keyboard")
 DEFAULT_PROFILE_FILE = os.path.join(CONFIG_DIR, "default_profile.json")
 
 # USB IDs
 VENDOR_ID = 0x3151
-PID_WIRELESS = 0x4011  # KU SKK 2,4GHz Dongle
-PID_WIRED = 0x4015     # KU SkillKorp Wired
+PID_WIRELESS = 0x4011  # "KU SKK 2,4GHz" receiver
+PID_WIRED = 0x4015     # "KU SkillKorp" wired
+PAYLOAD_LEN = 64
 
 # Polling Rate mappings: rate in Hz -> hardware code
 POLLING_RATE_MAP = {
@@ -51,7 +54,10 @@ POLLING_RATE_MAP = {
 }
 CODE_TO_POLLING_RATE = {1: 1000, 2: 500, 4: 250, 8: 125}
 
-# RGB Lighting Effects (FEA_CMD_SET_LEDPARAM = 0x07)
+# RGB lighting effects (FEA_CMD_SET_LEDPARAM = 0x07). Codes from the vendor's
+# setLightSetting(): LightOff=0, LightAlwaysOn=1, LightBreath=2, LightWave=4,
+# LightRipple=5, LightRaindrop=6, LightSnake=7, LightPressAction=8,
+# LightConverage=9, LightUserPicture=13.
 LIGHT_MODES = [
     ("off", "Éteint (Off)", 0),
     ("static", "Fixe (Always On)", 1),
@@ -64,48 +70,84 @@ LIGHT_MODES = [
     ("convergence", "Convergence", 9),
     ("custom", "Personnalisé (Custom)", 13),
 ]
-
 LIGHT_MODE_BY_CODE = {code: key for key, _, code in LIGHT_MODES}
 LIGHT_CODE_BY_KEY = {key: code for key, _, code in LIGHT_MODES}
 
-# Side RGB Lighting Effects (FEA_CMD_SET_SLEDPARAM = 0x08)
+# Side LED effects (FEA_CMD_SET_SLEDPARAM = 0x08): LightOff=0, AlwaysOn=1,
+# Breath=2, Neon=3 (colour cycling, shown as "rainbow"), Wave=4, Snake=5.
 SIDE_LIGHT_MODES = [
     ("off", "Éteint (Off)", 0),
     ("static", "Fixe (Static)", 1),
     ("breathing", "Respiration (Breathing)", 2),
     ("wave", "Onde (Wave)", 4),
     ("rainbow", "Arc-en-ciel (Rainbow)", 3),
+    ("snake", "Serpent (Snake)", 5),
 ]
 SIDE_LIGHT_MODE_BY_CODE = {code: key for key, _, code in SIDE_LIGHT_MODES}
 SIDE_LIGHT_CODE_BY_KEY = {key: code for key, _, code in SIDE_LIGHT_MODES}
 
-# Protocol Command Codes (reverse-engineered from iot_driver.exe / Electron client)
-CMD_SET_REPORT = 0x04      # Polling rate
-CMD_GET_REPORT = 0x84
-CMD_SET_PROFILE = 0x05     # Profile index
-CMD_GET_PROFILE = 0x85
-CMD_SET_LEDPARAM = 0x07    # Backlight LED config
-CMD_GET_LEDPARAM = 0x87
-CMD_SET_KBOPTION = 0x06    # Winlock, WASD swap, OS mode, Gaming mode
-CMD_GET_KBOPTION = 0x86
-CMD_SET_SLEDPARAM = 0x08   # Side LED config
-CMD_GET_SLEDPARAM = 0x88
-CMD_SET_KEYMATRIX = 0x09   # Full key matrix
-CMD_GET_KEYMATRIX = 0x89
-CMD_SET_RESERT = 0x02      # Factory reset
-CMD_SET_DEBOUNCE = 0x11    # Debounce time in ms
-CMD_GET_DEBOUNCE = 0x91
-CMD_SET_SLEEPTIME = 0x12   # Light & deep sleep times
-CMD_GET_SLEEPTIME = 0x92
-CMD_SET_KEYMATRIX_SIMPLE = 0x13  # Single key remapping
-CMD_GET_KEYMATRIX_SIMPLE = 0x93
-CMD_SET_FN_SIMPLE = 0x15         # Single Fn layer remapping
-CMD_GET_FN_SIMPLE = 0x95
-CMD_GET_BATTERY = 0x83     # Battery query
-CMD_GET_REV = 0x80         # Firmware revision
+# Wave direction option (vendor WAVEOP): stored in the high nibble of byte 4.
+WAVE_DIRECTIONS = {"right": 0, "left": 1, "down": 2, "up": 3}
 
-# Default 75% AZERTY Keyboard Layout (84 keys)
-# Matches OE.layout from official software exactly
+# Low nibble of the LED option byte: DAZZLE = multicolour, NORMAL = the RGB
+# colour given in bytes 5..7 (vendor class constants DAZZLE=8, NORMAL=7).
+LED_DAZZLE = 8
+LED_NORMAL = 7
+LED_MAX_SPEED = 4      # hardware speed byte = LED_MAX_SPEED - (speed - 1)
+WHITE_SUBSTITUTE = (0xFA, 0xFF, 0xFA)  # the vendor never sends pure #FFFFFF
+
+# Protocol command codes (YC3121 "rongyuan" keyboard class)
+CMD_SET_REV = 0x00
+CMD_GET_REV = 0x80         # firmware version
+CMD_SET_RESERT = 0x02      # factory reset
+CMD_SET_REPORT = 0x04      # polling rate
+CMD_GET_REPORT = 0x84
+CMD_SET_PROFILE = 0x05     # profile index
+CMD_GET_PROFILE = 0x85
+CMD_SET_KBOPTION = 0x06    # Win lock, OS mode, WASD swap, LED off, gaming...
+CMD_GET_KBOPTION = 0x86
+CMD_SET_LEDPARAM = 0x07    # backlight
+CMD_GET_LEDPARAM = 0x87
+CMD_SET_SLEDPARAM = 0x08   # side LEDs
+CMD_GET_SLEDPARAM = 0x88
+CMD_SET_KEYMATRIX = 0x09
+CMD_GET_KEYMATRIX = 0x89
+CMD_SET_DEBOUNCE = 0x11
+CMD_GET_DEBOUNCE = 0x91
+CMD_SET_SLEEPTIME = 0x12
+CMD_GET_SLEEPTIME = 0x92
+CMD_SET_KEYMATRIX_SIMPLE = 0x13  # single key remapping
+CMD_GET_KEYMATRIX_SIMPLE = 0x93
+CMD_SET_FN_SIMPLE = 0x15         # single Fn-layer remapping
+CMD_GET_FN_SIMPLE = 0x95
+CMD_GET_BATTERY = 0x83     # 2.4GHz battery query (iot_driver CMD list)
+# 2.4GHz receiver commands (handled by the receiver itself, see _rf_status()).
+RF_SET_NEXT_PACK_LENGTH = 0xFE  # [0xFE, 64]: sent once when the receiver appears
+RF_SET_PARAM = 0xF6             # [0xF6, 0x0A]: sent once, right after
+RF_PARAM_VALUE = 0x0A
+RF_GET_STATUS = 0xF7            # status, polled before every frame
+RF_FETCH_REPLY = 0xFC           # move the keyboard's answer into the GET buffer
+RF_STATUS_REPLY_READY = 0       # 1 = an answer from the keyboard is waiting
+RF_STATUS_BATTERY = 1           # battery percentage
+RF_STATUS_OFFLINE = 3           # non-zero while the keyboard is off or asleep
+RF_REPLY_TIMEOUT = 1.5          # max wait for the keyboard's answer over the air
+
+# Delays observed in the vendor code after each command (COMMONDELAY /
+# BIGCMDDELAY): the firmware writes its flash and drops frames meanwhile.
+DELAY_COMMON = 0.5
+DELAY_BIG = 1.0
+DELAY_KEY = 0.05
+
+# Limits declared for this model (vendor otherSetting "Pi"): light sleep
+# 1..60 min, deep sleep 10..60 min, 0 = never.
+LIGHT_SLEEP_RANGE = (60, 3600)
+DEEP_SLEEP_RANGE = (600, 3600)
+DEBOUNCE_RANGE = (2, 20)
+PROFILE_COUNT = 3
+
+# Default 75% AZERTY keyboard layout (85 entries: 84 keys + the rotary knob).
+# Matches OE.layout from the official software. "code" is the key's factory
+# action as found in DEFAULT_MATRIX; x/y/w/h are only used for drawing.
 KEY_LAYOUT = [
     # Row 1
     {"name": "Esc", "code": 41, "x": 99, "y": -16, "w": 29, "h": 34},
@@ -237,789 +279,887 @@ REMAP_ACTIONS: Dict[str, Tuple[str, List[int]]] = {
     "copy": ("Copier (Ctrl+C)", [0, 224, 6, 0]),
     "paste": ("Coller (Ctrl+V)", [0, 224, 25, 0]),
     "cut": ("Couper (Ctrl+X)", [0, 224, 27, 0]),
-    "undo": ("Annuler (Ctrl+Z)", [0, 224, 29, 0]),
+    # The K20 is an AZERTY keyboard: shortcuts are sent as HID usages, which
+    # the OS translates with its own layout. Usage 0x1A is the key labelled
+    # "Z" on AZERTY (0x1D would give Ctrl+W = close tab), 0x14 is "A"
+    # (0x04 would give Ctrl+Q = quit). QWERTY variants are kept for users
+    # whose OS layout is QWERTY.
+    "undo": ("Annuler (Ctrl+Z)", [0, 224, 26, 0]),
     "save": ("Enregistrer (Ctrl+S)", [0, 224, 22, 0]),
-    "select_all": ("Tout sélectionner (Ctrl+A)", [0, 224, 4, 0]),
+    "select_all": ("Tout sélectionner (Ctrl+A)", [0, 224, 20, 0]),
+    "undo_qwerty": ("Annuler (Ctrl+Z, OS en QWERTY)", [0, 224, 29, 0]),
+    "select_all_qwerty": ("Tout sélectionner (Ctrl+A, OS en QWERTY)", [0, 224, 4, 0]),
     "lock_screen": ("Verrouiller écran (Win+L)", [0, 227, 15, 0]),
     "show_desktop": ("Afficher Bureau (Win+D)", [0, 227, 7, 0]),
 
     # Special
     "disabled": ("Désactivé", [0, 0, 0, 0]),
+    # "default" restores the key's factory action (taken from DEFAULT_MATRIX /
+    # DEFAULT_FN_MATRIX); its bytes are resolved per key at send time.
+    "default": ("Action d'origine", []),
 }
 
 
-def _HIDIOCSFEATURE(length: int) -> int:
-    """Linux ioctl macro for HIDIOCSFEATURE: _IOC(_IOC_READ|_IOC_WRITE, 'H', 0x06, length)"""
-    return (3 << 30) | (length << 16) | (ord('H') << 8) | 0x06
+
+# Factory key matrix of the K20 (vendor "defaultMatrix" of yc3121_cx71d_soc):
+# 4 bytes per key [type, modifier, code, extra], 6 rows per column. The index
+# sent with CMD_SET_KEYMATRIX_SIMPLE is the entry index in this matrix, NOT
+# the position in KEY_LAYOUT.
+DEFAULT_MATRIX: List[int] = [
+    0, 0, 41, 0, 0, 0, 53, 0, 0, 0, 43, 0, 0, 0, 57, 0, 0, 0, 225, 0, 0, 0, 224, 0,
+    0, 0, 58, 0, 0, 0, 30, 0, 0, 0, 20, 0, 0, 0, 4, 0, 0, 0, 100, 0, 10, 1, 0, 0,
+    0, 0, 59, 0, 0, 0, 31, 0, 0, 0, 26, 0, 0, 0, 22, 0, 0, 0, 29, 0, 0, 0, 227, 0,
+    0, 0, 60, 0, 0, 0, 32, 0, 0, 0, 8, 0, 0, 0, 7, 0, 0, 0, 27, 0, 0, 0, 226, 0,
+    0, 0, 61, 0, 0, 0, 33, 0, 0, 0, 21, 0, 0, 0, 9, 0, 0, 0, 6, 0, 0, 0, 58, 0,
+    0, 0, 62, 0, 0, 0, 34, 0, 0, 0, 23, 0, 0, 0, 10, 0, 0, 0, 25, 0, 0, 0, 59, 0,
+    0, 0, 63, 0, 0, 0, 35, 0, 0, 0, 28, 0, 0, 0, 11, 0, 0, 0, 5, 0, 0, 0, 44, 0,
+    0, 0, 64, 0, 0, 0, 36, 0, 0, 0, 24, 0, 0, 0, 13, 0, 0, 0, 17, 0, 0, 0, 60, 0,
+    0, 0, 65, 0, 0, 0, 37, 0, 0, 0, 12, 0, 0, 0, 14, 0, 0, 0, 16, 0, 0, 0, 61, 0,
+    0, 0, 66, 0, 0, 0, 38, 0, 0, 0, 18, 0, 0, 0, 15, 0, 0, 0, 54, 0, 0, 0, 62, 0,
+    0, 0, 67, 0, 0, 0, 39, 0, 0, 0, 19, 0, 0, 0, 51, 0, 0, 0, 55, 0, 0, 0, 230, 0,
+    0, 0, 68, 0, 0, 0, 45, 0, 0, 0, 47, 0, 0, 0, 52, 0, 0, 0, 56, 0, 0, 0, 231, 0,
+    0, 0, 69, 0, 0, 0, 46, 0, 0, 0, 48, 0, 0, 0, 0, 0, 0, 0, 229, 0, 0, 0, 80, 0,
+    3, 0, 33, 2, 0, 0, 42, 0, 0, 0, 49, 0, 0, 0, 40, 0, 0, 0, 82, 0, 0, 0, 81, 0,
+    0, 0, 76, 0, 0, 0, 74, 0, 0, 0, 77, 0, 0, 0, 75, 0, 0, 0, 78, 0, 0, 0, 79, 0,
+    3, 0, 233, 0, 3, 0, 234, 0,
+]
+# Factory Fn layer (vendor "defaultFnMatrix"), same indexing.
+DEFAULT_FN_MATRIX: List[int] = [
+    10, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13, 1, 0, 0, 0, 0, 0, 0,
+    14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    14, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 3, 0, 0,
+    14, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 226, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 234, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 233, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 182, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 205, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 181, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 227, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 3, 0, 0,
+    0, 0, 226, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 227, 15, 13, 5, 1, 0, 13, 3, 1, 0,
+    0, 0, 0, 0, 10, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13, 2, 1, 0, 13, 2, 2, 0,
+    10, 2, 0, 0, 0, 0, 73, 0, 0, 0, 70, 0, 0, 0, 71, 0, 0, 0, 72, 0, 13, 3, 2, 0,
+]
+EMPTY_KEY_VALUE = 0xFFFFFFFF   # "Molette" (rotary knob press) placeholder
+EMPTY_KEY_INDEX = 75           # vendor emptyKeyIndex for this model
 
 
-def _HIDIOCGFEATURE(length: int) -> int:
-    """Linux ioctl macro for HIDIOCGFEATURE: _IOC(_IOC_READ|_IOC_WRITE, 'H', 0x07, length)"""
-    return (3 << 30) | (length << 16) | (ord('H') << 8) | 0x07
+def _matrix_entry(matrix: List[int], index: int) -> List[int]:
+    entry = matrix[4 * index:4 * index + 4]
+    return entry + [0] * (4 - len(entry))
+
+
+def find_matrix_index(code: int, occurrence: int = 0) -> Optional[int]:
+    """Vendor findIndexInDefaultMatrix(): locate a factory key code in DEFAULT_MATRIX."""
+    if code == EMPTY_KEY_VALUE:
+        return EMPTY_KEY_INDEX
+    if code <= 0xFF:
+        target = [0, 0, code, 0]
+    else:
+        target = list(code.to_bytes(4, "big"))
+    seen = 0
+    for idx in range(len(DEFAULT_MATRIX) // 4):
+        if _matrix_entry(DEFAULT_MATRIX, idx) == target:
+            if seen == occurrence:
+                return idx
+            seen += 1
+    return None
+
+
+KEY_MATRIX_INDEX: Dict[str, int] = {}
+for _k in KEY_LAYOUT:
+    _idx = find_matrix_index(_k["code"])
+    if _idx is not None:
+        KEY_MATRIX_INDEX[_k["name"]] = _idx
+del _k, _idx
+
+
+def _key_by_name(key_name: str) -> Dict[str, Any]:
+    for k in KEY_LAYOUT:
+        if k["name"].lower() == str(key_name).lower():
+            return k
+    raise ValueError(f"Touche inconnue: {key_name}")
+
+
+def apply_checksum(payload: bytearray, checksum_type: Optional[str] = "bit7") -> bytearray:
+    """One's-complement checksum used by the YC3121 firmware (see module doc)."""
+    if checksum_type == "bit7":
+        payload[7] = (~sum(payload[0:7])) & 0xFF
+    elif checksum_type == "bit8":
+        payload[8] = (~sum(payload[0:8])) & 0xFF
+    return payload
+
+
+def parse_hex_color(color: Optional[str]) -> Optional[Tuple[int, int, int]]:
+    if color is None:
+        return None
+    if isinstance(color, (list, tuple)) and len(color) == 3:
+        return tuple(max(0, min(255, int(c))) for c in color)
+    text = str(color).strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(ch * 2 for ch in text)
+    if len(text) != 6:
+        raise ValueError(f"Couleur invalide: {color!r} (format attendu #RRGGBB)")
+    try:
+        return int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16)
+    except ValueError:
+        raise ValueError(f"Couleur invalide: {color!r} (format attendu #RRGGBB)") from None
+
+
+def format_hex_color(rgb: Tuple[int, int, int]) -> str:
+    return "#{:02X}{:02X}{:02X}".format(*rgb)
+
+
+def _clamp(value, lo, hi) -> int:
+    return max(lo, min(hi, int(value)))
+
+
+# =============================================================================
+# Pure frame builders (unit-tested byte for byte)
+# =============================================================================
+
+def build_led_frame(mode: str, speed: int, brightness: int, direction: int,
+                    rgb: Tuple[int, int, int], colorful: bool) -> bytearray:
+    code = LIGHT_CODE_BY_KEY[mode]
+    p = bytearray(PAYLOAD_LEN)
+    p[0] = CMD_SET_LEDPARAM
+    p[1] = code
+    flag = LED_DAZZLE if colorful else LED_NORMAL
+    if code == 0:  # off: no speed/colour
+        p[4] = LED_NORMAL
+    elif code == 13:  # user picture: option index, fixed colour
+        p[3] = _clamp(brightness, 0, 4)
+        p[4] = 0
+        p[5], p[6], p[7] = 0, 200, 200
+    else:
+        p[2] = LED_MAX_SPEED - (_clamp(speed, 1, 5) - 1)
+        p[3] = _clamp(brightness, 0, 4)
+        p[4] = ((_clamp(direction, 0, 3) << 4) | flag) if code == 4 else flag
+        r, g, b = WHITE_SUBSTITUTE if tuple(rgb) == (255, 255, 255) else rgb
+        p[5], p[6], p[7] = r, g, b
+    return apply_checksum(p, "bit8")
+
+
+def build_side_led_frame(mode: str, speed: int, brightness: int,
+                         rgb: Tuple[int, int, int], colorful: bool) -> bytearray:
+    code = SIDE_LIGHT_CODE_BY_KEY[mode]
+    p = bytearray(PAYLOAD_LEN)
+    p[0] = CMD_SET_SLEDPARAM
+    p[1] = code
+    flag = LED_DAZZLE if colorful else LED_NORMAL
+    if code == 0:
+        p[4] = LED_NORMAL
+    else:
+        # Unlike the main backlight, the side LED speed byte is not inverted.
+        p[2] = _clamp(speed, 1, 5) - 1
+        p[3] = _clamp(brightness, 0, 4)
+        if code == 3:  # neon/rainbow: no colour, default option
+            p[4] = LED_NORMAL
+        else:
+            p[4] = flag
+            r, g, b = WHITE_SUBSTITUTE if tuple(rgb) == (255, 255, 255) else rgb
+            p[5], p[6], p[7] = r, g, b
+    return apply_checksum(p, "bit8")
+
+
+def build_polling_rate_frame(rate_hz: int, profile_idx: int) -> bytearray:
+    p = bytearray(PAYLOAD_LEN)
+    p[0] = CMD_SET_REPORT
+    p[1] = profile_idx
+    p[2] = POLLING_RATE_MAP[rate_hz]
+    return apply_checksum(p, "bit7")
+
+
+def build_debounce_frame(debounce_ms: int) -> bytearray:
+    p = bytearray(PAYLOAD_LEN)
+    p[0] = CMD_SET_DEBOUNCE
+    p[2] = debounce_ms
+    return apply_checksum(p, "bit7")
+
+
+def build_sleep_frame(light_sleep_sec: int, deep_sleep_sec: int) -> bytearray:
+    p = bytearray(PAYLOAD_LEN)
+    p[0] = CMD_SET_SLEEPTIME
+    # [8..9] BT light, [10..11] 2.4G light, [12..13] BT deep, [14..15] 2.4G deep
+    for offset, value in ((8, light_sleep_sec), (10, light_sleep_sec),
+                          (12, deep_sleep_sec), (14, deep_sleep_sec)):
+        p[offset] = value & 0xFF
+        p[offset + 1] = (value >> 8) & 0xFF
+    return apply_checksum(p, "bit7")
+
+
+def build_options_frame(options_byte: int, fn_byte: int, power_byte: int, profile_idx: int) -> bytearray:
+    p = bytearray(PAYLOAD_LEN)
+    p[0] = CMD_SET_KBOPTION
+    p[1] = profile_idx
+    p[2] = options_byte & 0xFF
+    p[3] = fn_byte & 0xFF
+    p[4] = power_byte & 0xFF
+    return apply_checksum(p, "bit7")
+
+
+def build_key_frame(cmd: int, profile_idx: int, matrix_idx: int, action: List[int]) -> bytearray:
+    p = bytearray(PAYLOAD_LEN)
+    p[0] = cmd
+    p[1] = profile_idx
+    p[2] = matrix_idx
+    apply_checksum(p, "bit7")  # covers bytes 0..6 only
+    p[8:12] = bytes(action[:4])
+    return p
+
+
+def build_simple_frame(cmd: int, arg1: int = 0) -> bytearray:
+    p = bytearray(PAYLOAD_LEN)
+    p[0] = cmd
+    p[1] = arg1
+    return apply_checksum(p, "bit7")
+
+
+# Keyboard option bits (vendor setKeyboardOption / getKeyboardOption)
+OPT_WIN_LOCK = 1 << 0
+OPT_OS_MAC = 1 << 1
+OPT_WASD_SWAP = 1 << 3
+OPT_LED_OFF = 1 << 4
+OPT_SIDE_LED_OFF = 1 << 5
+OPT_GAMING = 1 << 6
+OPT_KEYBOARD_LOCK = 1 << 7
+OS_MODES = ("win", "mac")
+
+
+def encode_options(base: int, win_lock: bool, wasd_swap: bool, os_mode: str, gaming_mode: bool) -> int:
+    value = base & ~(OPT_WIN_LOCK | OPT_OS_MAC | OPT_WASD_SWAP | OPT_GAMING) & 0xFF
+    if win_lock:
+        value |= OPT_WIN_LOCK
+    if os_mode == "mac":
+        value |= OPT_OS_MAC
+    if wasd_swap:
+        value |= OPT_WASD_SWAP
+    if gaming_mode:
+        value |= OPT_GAMING
+    return value
+
+
+# Backwards-compatible names (CI smoke test & external scripts).
+_HIDIOCSFEATURE = hidraw.HIDIOCSFEATURE
+_HIDIOCGFEATURE = hidraw.HIDIOCGFEATURE
 
 
 class SkillkorpK20Driver(SkillkorpDeviceDriver):
-    """High-level Python driver for SkillKorp K20 Ultimate gaming keyboard."""
+    """High-level driver for the SkillKorp K20 Ultimate keyboard."""
 
     device_type = "keyboard"
-    _config_mtime: float = 0.0
+    display_name = "Clavier SkillKorp K20"
 
     def __init__(self, dev_path: Optional[str] = None):
-        self.dev_path = dev_path or self.find_device()
-        self._config_mtime = 0.0
-        self.config = self._load_or_default_config()
+        self.last_error = ""
+        self._pending_gap = 0.0
+        self._last_command_end = 0.0
+        self._options_cache: Optional[Tuple[int, int, int]] = None
+        self._rf_initialised: Optional[str] = None
+        # Settings sent while the keyboard sleeps are saved and marked pending
+        # ("pending_sync" in the config), then re-sent once it answers again.
+        self.defer_when_offline = True
+        self.last_deferred = False
+        self._syncing = False
+        super().__init__(dev_path)
 
-    def reload_config_if_changed(self) -> bool:
-        """Reload self.config from disk if the configuration file has been modified externally."""
-        try:
-            if not os.path.exists(DEFAULT_PROFILE_FILE):
-                return False
-            mtime = os.path.getmtime(DEFAULT_PROFILE_FILE)
-            if mtime != getattr(self, "_config_mtime", 0.0):
-                self.config = self._load_or_default_config()
-                self._config_mtime = mtime
-                return True
-        except Exception:
-            pass
-        return False
-
+    # ------------------------------------------------------------------
+    # Discovery / config plumbing
+    # ------------------------------------------------------------------
     @staticmethod
-    def find_device() -> Optional[str]:
-        """Find the vendor hidraw device node for SkillKorp K20 (Interface 2, Usage Page 0xFFFF)."""
-        candidates = []
-        for path in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
-            try:
-                uevent_path = os.path.join(path, "device", "uevent")
-                if not os.path.exists(uevent_path):
-                    continue
-                with open(uevent_path, "r") as f:
-                    content = f.read()
+    def _is_vendor_interface(node: HidrawNode) -> bool:
+        rep = node.reports
+        return 0xFFFF in rep.usage_pages and rep.feature.get(0) == PAYLOAD_LEN
 
-                # Check for SkillKorp K20 VID (0x3151) and PID (0x4011 wireless or 0x4015 wired)
-                is_k20 = False
-                if "00003151:00004011" in content or "00003151:00004015" in content:
-                    is_k20 = True
-                elif "3151:4011" in content or "3151:4015" in content:
-                    is_k20 = True
+    @classmethod
+    def find_nodes(cls) -> List[HidrawNode]:
+        nodes = hidraw.find_nodes(VENDOR_ID, (PID_WIRED, PID_WIRELESS), cls._is_vendor_interface)
+        # Prefer the cable when both the cable and the receiver are plugged in.
+        nodes.sort(key=lambda n: 0 if n.product_id == PID_WIRED else 1)
+        return nodes
 
-                if not is_k20:
-                    continue
+    def wireless_product_ids(self) -> tuple:
+        return (PID_WIRELESS,)
 
-                hidraw_name = os.path.basename(path)
-                dev_node = f"/dev/{hidraw_name}"
+    def config_file(self) -> str:
+        return DEFAULT_PROFILE_FILE
 
-                # Verify Interface 2 (vendor feature report interface)
-                desc_path = os.path.join(path, "device", "report_descriptor")
-                if os.path.exists(desc_path):
-                    with open(desc_path, "rb") as df:
-                        desc = df.read()
-                    # Interface 2 signature: exactly 20 bytes with [0x06, 0xFF, 0xFF, 0x09, 0x02]
-                    # (Usage Page 0xFFFF, Usage 0x0002).
-                    if (len(desc) == 20 and desc[0] == 0x06 and desc[1] == 0xFF
-                            and desc[2] == 0xFF and desc[3] == 0x09 and desc[4] == 0x02):
-                        return dev_node
-
-                candidates.append(dev_node)
-            except Exception:
-                continue
-
-        # If descriptor check couldn't distinguish, pick the highest interface node
-        if candidates:
-            return candidates[-1]
-        return None
-
-    def is_connected(self) -> bool:
-        """Check if the K20 device is currently present and accessible."""
-        dev = self.find_device()
-        if dev and os.path.exists(dev):
-            self.dev_path = dev
-            return True
-        return False
-
-    def is_wireless(self) -> bool:
-        """Return True if connected via 2.4GHz wireless dongle (PID 4011)."""
-        if not self.dev_path:
-            return False
-        hidraw_name = os.path.basename(self.dev_path)
-        uevent_path = f"/sys/class/hidraw/{hidraw_name}/device/uevent"
-        if os.path.exists(uevent_path):
-            with open(uevent_path, "r") as f:
-                c = f.read()
-                return "4011" in c
-        return False
-
-    @staticmethod
-    def _is_wireless_fd(fd: int) -> bool:
-        """Return True if the open hidraw *fd* belongs to the 2.4GHz dongle (PID 0x4011).
-
-        Reads /proc/self/fd/<fd> -> resolves to /dev/hidrawN, then checks the
-        corresponding sysfs uevent for PID 4011.  Falls back to False on any
-        error so the wired code-path is never broken.
-        """
-        try:
-            dev_path = os.readlink(f"/proc/self/fd/{fd}")
-            hidraw_name = os.path.basename(dev_path)
-            uevent_path = f"/sys/class/hidraw/{hidraw_name}/device/uevent"
-            if os.path.exists(uevent_path):
-                with open(uevent_path, "r") as f:
-                    return "4011" in f.read()
-        except Exception:
-            pass
-        return False
-
-    @staticmethod
-    def _apply_checksum(payload: bytearray, checksum_type: str = "bit7") -> bytearray:
-        """Apply one's-complement checksum to a 64-byte payload.
-
-        - 'bit7': payload[7] = (~sum(payload[0:7])) & 0xFF
-                  Used by default for standard commands (options, debounce, rate,
-                  sleep, key remaps, query commands).
-        - 'bit8': payload[8] = (~sum(payload[0:8])) & 0xFF
-                  Used for LED parameter commands (CMD_SET_LEDPARAM, CMD_SET_SLEDPARAM).
-        """
-        if checksum_type == "bit7":
-            csum = sum(payload[0:7]) & 0xFF
-            payload[7] = (~csum) & 0xFF
-        elif checksum_type == "bit8":
-            csum = sum(payload[0:8]) & 0xFF
-            payload[8] = (~csum) & 0xFF
-        return payload
-
-    def _send_feature_report(self, payload: bytes, checksum_type: Optional[str] = "bit7") -> bool:
-        """Send a 65-byte HID feature report to the keyboard (byte 0 = 0x00 Report ID).
-
-        For the 2.4GHz wireless dongle (PID 0x4011) the YC3121 RF firmware requires a
-        two-step transaction (reverse-engineered from iot_driver.exe, function at VA
-        0x56ab90, states 0 → 3):
-
-          Step 1 – "fe_24_set_next_pack_length":
-            Send a 65-byte feature report whose payload is:
-              byte[0] = 0xFE  (dongle routing marker)
-              byte[1] = payload_length (always 64 for a full command)
-              bytes[2..63] = 0x00
-            This tells the RF dongle how many bytes follow in the next frame.
-
-          Step 2 – send the actual command payload (same 65-byte frame as wired).
-
-        The wired path (PID 0x4015) sends only Step 2 as before, unchanged.
-        """
-        dev = self.dev_path or self.find_device()
-        if not dev or not os.path.exists(dev):
-            return False
-
-        # Ensure buffer is exactly 64 bytes for payload
-        p = bytearray(64)
-        for i in range(min(len(payload), 64)):
-            p[i] = payload[i]
-
-        if checksum_type:
-            self._apply_checksum(p, checksum_type)
-
-        buf = bytearray(65)
-        buf[0] = 0x00
-        buf[1:65] = p
-
-        try:
-            fd = os.open(dev, os.O_RDWR)
-            try:
-                # Wireless dongle (3151:4011) requires a length-prefix packet first
-                if self._is_wireless_fd(fd):
-                    prefix = bytearray(65)
-                    prefix[0] = 0x00   # HID Report ID
-                    prefix[1] = 0xFE   # YC3121 dongle routing marker
-                    prefix[2] = 64     # payload_length that follows
-                    # bytes[3..64] = 0x00 (already zeroed)
-                    fcntl.ioctl(fd, _HIDIOCSFEATURE(65), prefix)
-                    time.sleep(0.005)   # ~5 ms inter-frame gap observed in USB traces
-
-                ret = fcntl.ioctl(fd, _HIDIOCSFEATURE(65), buf)
-                return ret == 65 or (isinstance(ret, bytes) and len(ret) == 65)
-            finally:
-                os.close(fd)
-        except PermissionError:
-            print(f"Erreur de permission sur {dev}. Assurez-vous que la règle udev est active.", file=sys.stderr)
-            return False
-        except Exception as e:
-            print(f"Erreur d'envoi de rapport HID: {e}", file=sys.stderr)
-            return False
-
-    def _read_feature_report(self, cmd: int, length: int = 65, checksum_type: str = "bit7") -> Optional[bytearray]:
-        """Send a feature report query and read back the reply via HIDIOCSFEATURE + HIDIOCGFEATURE.
-
-        1. Populates buf[0] = 0x00 (Report ID), buf[1] = cmd, calculates checksum, and sends via _HIDIOCSFEATURE(length).
-        2. Reads the response into read_buf via _HIDIOCGFEATURE(length).
-
-        For the 2.4GHz wireless dongle (PID 0x4011), a [0xFE, payload_len] prefix frame
-        is sent before the query payload (same two-step protocol as _send_feature_report).
-        """
-        dev = self.dev_path or self.find_device()
-        if not dev or not os.path.exists(dev):
-            return None
-
-        query_payload = bytearray(64)
-        query_payload[0] = cmd
-        if checksum_type:
-            self._apply_checksum(query_payload, checksum_type)
-
-        buf = bytearray(length)
-        buf[0] = 0x00
-        buf[1:min(length, 65)] = query_payload[:min(length - 1, 64)]
-
-        try:
-            fd = os.open(dev, os.O_RDWR)
-            try:
-                # Wireless dongle (3151:4011) requires a length-prefix packet before each write
-                if self._is_wireless_fd(fd):
-                    prefix = bytearray(65)
-                    prefix[0] = 0x00   # HID Report ID
-                    prefix[1] = 0xFE   # YC3121 dongle routing marker
-                    prefix[2] = 64     # payload_length that follows
-                    fcntl.ioctl(fd, _HIDIOCSFEATURE(65), prefix)
-                    time.sleep(0.005)
-
-                fcntl.ioctl(fd, _HIDIOCSFEATURE(length), buf)
-                time.sleep(0.02)
-                read_buf = bytearray(length)
-                read_buf[0] = 0x00
-                fcntl.ioctl(fd, _HIDIOCGFEATURE(length), read_buf)
-                return read_buf
-            finally:
-                os.close(fd)
-        except PermissionError:
-            print(f"Erreur de permission sur {dev}. Assurez-vous que la règle udev est active.", file=sys.stderr)
-            return None
-        except Exception as e:
-            print(f"Erreur de lecture de rapport HID: {e}", file=sys.stderr)
-            return None
-
-
-    # =========================================================================
-    # Configuration Persistence
-    # =========================================================================
-
-    def _default_config(self) -> Dict[str, Any]:
+    def default_config(self) -> Dict[str, Any]:
         return {
             "profile_name": "Par défaut",
             "profile_index": 0,
             "polling_rate": 1000,
             "debounce_ms": 8,
             "sleep": {
-                "light_sleep_sec": 120,    # 2 minutes
-                "deep_sleep_sec": 1680,   # 28 minutes
+                "light_sleep_sec": 120,
+                "deep_sleep_sec": 1680,
             },
             "options": {
                 "win_lock": False,
                 "wasd_swap": False,
-                "os_mode": "win",         # "win", "mac", "ios", "android"
+                "os_mode": "win",
                 "gaming_mode": False,
             },
             "rgb": {
                 "mode": "wave",
-                "speed": 3,               # 1 (slow) to 5 (fast)
-                "brightness": 4,          # 0 (off) to 4 (max)
-                "direction": 0,           # 0 = right-to-left, 1 = left-to-right
-                "color": "#FF0000",       # Red
+                "speed": 3,
+                "brightness": 4,
+                "direction": 0,
+                "color": "#FF0000",
+                "colorful": True,
             },
             "side_rgb": {
                 "mode": "rainbow",
                 "speed": 3,
                 "brightness": 4,
                 "color": "#00FFCC",
+                "colorful": False,
             },
-            "key_remaps": {},            # key_name -> remap_action
-            "fn_remaps": {},             # key_name -> remap_action
+            "key_remaps": {},
+            "fn_remaps": {},
         }
 
-    def _load_or_default_config(self) -> Dict[str, Any]:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        if os.path.exists(DEFAULT_PROFILE_FILE):
-            try:
-                with open(DEFAULT_PROFILE_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self._config_mtime = os.path.getmtime(DEFAULT_PROFILE_FILE)
-                # Merge with defaults
-                cfg = self._default_config()
-                self._deep_merge(cfg, data)
-                return cfg
-            except Exception:
-                pass
-        cfg = self._default_config()
-        self.save_config(cfg)
+    def sanitize_config(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        d = self.default_config()
+        try:
+            if cfg.get("polling_rate") not in POLLING_RATE_MAP:
+                cfg["polling_rate"] = d["polling_rate"]
+            cfg["profile_index"] = _clamp(cfg.get("profile_index", 0), 0, PROFILE_COUNT - 1)
+            cfg["debounce_ms"] = _clamp(cfg.get("debounce_ms", 8), *DEBOUNCE_RANGE)
+            rgb = cfg.setdefault("rgb", {})
+            if rgb.get("mode") not in LIGHT_CODE_BY_KEY:
+                rgb["mode"] = d["rgb"]["mode"]
+            srgb = cfg.setdefault("side_rgb", {})
+            if srgb.get("mode") not in SIDE_LIGHT_CODE_BY_KEY:
+                srgb["mode"] = d["side_rgb"]["mode"]
+            for section in (rgb, srgb):
+                try:
+                    parse_hex_color(section.get("color"))
+                except ValueError:
+                    section["color"] = "#FF0000"
+            opts = cfg.setdefault("options", {})
+            if opts.get("os_mode") not in OS_MODES:
+                opts["os_mode"] = "win"
+            for key in ("key_remaps", "fn_remaps"):
+                if not isinstance(cfg.get(key), dict):
+                    cfg[key] = {}
+        except (TypeError, ValueError):
+            return d
         return cfg
 
-    def _deep_merge(self, base: dict, override: dict):
-        for k, v in override.items():
-            if isinstance(v, dict) and k in base and isinstance(base[k], dict):
-                self._deep_merge(base[k], v)
-            else:
-                base[k] = v
+    # ------------------------------------------------------------------
+    # Transport
+    # ------------------------------------------------------------------
+    def _wait_command_gap(self, gap: float):
+        remaining = self._last_command_end + gap - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
 
-    def save_config(self, config: Optional[Dict[str, Any]] = None):
-        """Save current configuration to disk."""
-        if config is not None:
-            self.config = config
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(DEFAULT_PROFILE_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.config, f, indent=2, ensure_ascii=False)
+    # Over the 2.4GHz receiver (sequence captured from the vendor software):
+    #   init (once per plug-in): F7, [FE 40], F7, [F6 0A]
+    #   write: F7 poll, then the frame unchanged (the keyboard applies it ~1 s
+    #          later and the receiver emits input report 05 0F 00 00)
+    #   read:  F7 poll, query frame, poll F7 until byte 0 = 1 (answer ready),
+    #          [FC], then GET_FEATURE returns the keyboard's answer.
+    # An answer that is never fetched with FC blocks the receiver: it drops
+    # every following frame. _rf_prepare() drains such a leftover answer.
+    @staticmethod
+    def _rf_command(dev, *data: int) -> None:
+        frame = bytearray(PAYLOAD_LEN)
+        frame[:len(data)] = bytes(data)
+        dev.set_feature(b"\x00" + bytes(frame))
+
+    @staticmethod
+    def _get_payload(dev) -> bytes:
+        data = dev.get_feature(0, PAYLOAD_LEN + 1)
+        return bytes(data[1:]) if len(data) > PAYLOAD_LEN else bytes(data)
+
+    def _rf_status(self, dev) -> bytes:
+        """Receiver status: [answer ready, battery %, 0, offline, 1, 1, 1, ...]
+        (bytes past 6 are leftovers of the previous frame)."""
+        self._rf_command(dev, RF_GET_STATUS)
+        time.sleep(0.015)
+        return self._get_payload(dev)
+
+    def _rf_fetch(self, dev) -> bytes:
+        self._rf_command(dev, RF_FETCH_REPLY)
+        time.sleep(0.03)
+        return self._get_payload(dev)
+
+    def _rf_prepare(self, dev) -> bytes:
+        """Initialise the receiver once per plug-in, refuse to send while the
+        keyboard is offline and drain any answer left unread."""
+        status = self._rf_status(dev)
+        key = hidraw.usb_device_path(dev.node) or dev.node.devnode
+        if self._rf_initialised != key:
+            self._rf_command(dev, RF_SET_NEXT_PACK_LENGTH, PAYLOAD_LEN)
+            time.sleep(0.1)
+            status = self._rf_status(dev)
+            self._rf_command(dev, RF_SET_PARAM, RF_PARAM_VALUE)
+            time.sleep(0.015)
+            self._rf_initialised = key
+        if len(status) > RF_STATUS_OFFLINE and status[RF_STATUS_OFFLINE]:
+            raise KeyboardOfflineError("Le clavier est éteint ou en veille : appuyez sur une touche puis réessayez.")
+        if status and status[RF_STATUS_REPLY_READY]:
+            self._rf_fetch(dev)
+            status = self._rf_status(dev)
+            if status and status[RF_STATUS_REPLY_READY]:
+                raise DeviceError("Le récepteur 2.4 GHz ne répond plus correctement : "
+                                  "débranchez-le puis rebranchez-le.")
+        return status
+
+    def _write_frame(self, dev, payload: bytes):
+        if dev.node.product_id == PID_WIRELESS:
+            self._rf_prepare(dev)
+        dev.set_feature(b"\x00" + bytes(payload[:PAYLOAD_LEN]))
+
+    def _send(self, payloads, settle: float = DELAY_COMMON) -> None:
+        """Send one or more 64-byte payloads in a single locked transaction.
+
+        Raises DeviceError on failure. *settle* is the time the firmware needs
+        before accepting the next command (enforced lazily before the next send).
+        """
+        if isinstance(payloads, (bytes, bytearray)):
+            payloads = [payloads]
+        self._wait_command_gap(getattr(self, "_pending_gap", 0.0))
+        with self.open_device() as dev:
+            for i, payload in enumerate(payloads):
+                if i:
+                    time.sleep(DELAY_KEY)
+                self._write_frame(dev, payload)
+        self._last_command_end = time.monotonic()
+        self._pending_gap = settle
+
+    def _send_feature_report(self, payload: bytes, checksum_type: Optional[str] = "bit7") -> bool:
+        """Compatibility wrapper: checksum + send, returns True/False."""
+        p = bytearray(PAYLOAD_LEN)
+        p[:min(len(payload), PAYLOAD_LEN)] = bytes(payload[:PAYLOAD_LEN])
+        if checksum_type:
+            apply_checksum(p, checksum_type)
         try:
-            self._config_mtime = os.path.getmtime(DEFAULT_PROFILE_FILE)
-        except Exception:
-            pass
+            self._send(p)
+            return True
+        except DeviceError as e:
+            self.last_error = str(e)
+            return False
 
-    # =========================================================================
-    # Hardware Controls
-    # =========================================================================
+    def _query(self, cmd: int, arg1: int = 0, timeout: float = 0.02) -> bytes:
+        """Write a GET command and read the 64-byte answer (report ID stripped)."""
+        self._wait_command_gap(getattr(self, "_pending_gap", 0.0))
+        with self.open_device() as dev:
+            if dev.node.product_id == PID_WIRELESS:
+                data = self._rf_query(dev, cmd, arg1)
+            else:
+                self._write_frame(dev, build_simple_frame(cmd, arg1))
+                time.sleep(timeout)
+                data = self._get_payload(dev)
+        self._last_command_end = time.monotonic()
+        self._pending_gap = 0.0
+        return data
 
-    def set_rgb(
-        self,
-        mode: str,
-        speed: int = 3,
-        brightness: int = 4,
-        direction: int = 0,
-        color: Optional[str] = None,
-    ) -> bool:
+    def _rf_query(self, dev, cmd: int, arg1: int) -> bytes:
+        self._write_frame(dev, build_simple_frame(cmd, arg1))
+        deadline = time.monotonic() + RF_REPLY_TIMEOUT
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+            status = self._rf_status(dev)
+            if status and status[RF_STATUS_REPLY_READY]:
+                return self._rf_fetch(dev)
+        raise DeviceError("Le clavier n'a pas répondu via le récepteur 2.4 GHz.")
+
+    def _read_feature_report(self, cmd: int, length: int = 65, checksum_type: str = "bit7") -> Optional[bytearray]:
+        """Compatibility wrapper returning [report_id] + payload, or None."""
+        try:
+            return bytearray(b"\x00" + self._query(cmd))
+        except DeviceError as e:
+            self.last_error = str(e)
+            return None
+
+    @staticmethod
+    def _apply_checksum(payload: bytearray, checksum_type: str = "bit7") -> bytearray:
+        return apply_checksum(payload, checksum_type)
+
+    def _guard(self, func, *args, pending: Optional[str] = None, **kwargs) -> bool:
+        """Run a transport call: True on success, False if the keyboard refused
+        the frame. Missing device / permission / busy errors are raised.
+
+        *pending* names the setting being written: if the keyboard is asleep
+        it is recorded for sync_pending() and the call counts as a success
+        (the caller then saves the new value); last_deferred tells which."""
+        self.last_deferred = False
+        try:
+            func(*args, **kwargs)
+            self.last_error = ""
+        except (DevicePermissionError, DeviceNotFoundError, DeviceBusyError):
+            raise
+        except KeyboardOfflineError as e:
+            if not (pending and self.defer_when_offline and not self._syncing):
+                self.last_error = str(e)
+                return False
+            self._mark_pending(pending)
+            self.last_deferred = True
+            self.last_error = ""
+            return True
+        except DeviceError as e:
+            self.last_error = str(e)
+            return False
+        if pending and not self._syncing:
+            self._unmark_pending(pending)
+            self.sync_pending()
+        return True
+
+    # ------------------------------------------------------------------
+    # Settings deferred while the keyboard sleeps
+    # ------------------------------------------------------------------
+    def _mark_pending(self, key: str) -> None:
+        def mutate(cfg):
+            keys = set(cfg.get("pending_sync") or [])
+            keys.add(key)
+            cfg["pending_sync"] = sorted(keys)
+        self.update_config(mutate)
+
+    def _unmark_pending(self, key: str) -> None:
+        if key in (self.config.get("pending_sync") or []):
+            self.update_config(lambda cfg: cfg.__setitem__(
+                "pending_sync", [k for k in cfg.get("pending_sync") or [] if k != key]))
+
+    def pending_settings(self) -> List[str]:
+        self.reload_config_if_changed()
+        pending = self.config.get("pending_sync")
+        return list(pending) if isinstance(pending, list) else []
+
+    def sync_pending(self) -> bool:
+        """Re-send the settings saved while the keyboard was asleep.
+
+        Returns True when nothing is left pending. Cheap while the keyboard
+        still sleeps (one receiver status poll), so it can be called from a
+        periodic status check."""
+        pending = self.pending_settings()
+        if not pending or self._syncing:
+            return not pending
+        cfg = self.config
+        # The hardware profile first: the other settings are stored per profile.
+        order = sorted(pending, key=lambda k: (k != "profile_index", k))
+        self._syncing = True
+        try:
+            for key in order:
+                section, _, name = key.partition(":")
+                if section == "profile_index":
+                    ok = self.set_profile(cfg.get("profile_index", 0))
+                elif section == "rgb":
+                    ok = self.set_rgb()
+                elif section == "side_rgb":
+                    ok = self.set_side_rgb()
+                elif section == "polling_rate":
+                    ok = self.set_polling_rate(cfg.get("polling_rate", 1000))
+                elif section == "debounce_ms":
+                    ok = self.set_debounce(cfg.get("debounce_ms", 8))
+                elif section == "sleep":
+                    sl = cfg.get("sleep", {})
+                    ok = self.set_sleep_time(sl.get("light_sleep_sec", 120), sl.get("deep_sleep_sec", 1680))
+                elif section == "options":
+                    ok = self.set_keyboard_options()
+                elif section in ("key_remaps", "fn_remaps") and name:
+                    action = cfg.get(section, {}).get(name, "default")
+                    ok = self._remap(name, action, None, section == "fn_remaps")
+                else:
+                    ok = True  # unknown entry (older/newer version): drop it
+                if not ok:
+                    return False  # still asleep or refused: keep the rest pending
+                self._unmark_pending(key)
+                cfg = self.config
+        except ValueError:
+            return False
+        finally:
+            self._syncing = False
+        return not self.pending_settings()
+
+    # ------------------------------------------------------------------
+    # Hardware controls (return True on success, False on device error,
+    # raise ValueError on invalid arguments)
+    # ------------------------------------------------------------------
+    def _resolve_led(self, section: str, mode, speed, brightness, color, colorful):
+        cur = self.config.get(section, {})
+        mode = (mode or cur.get("mode") or "static").lower()
+        table = LIGHT_CODE_BY_KEY if section == "rgb" else SIDE_LIGHT_CODE_BY_KEY
+        if mode not in table:
+            raise ValueError(f"Mode d'éclairage inconnu: {mode}. Choix: {', '.join(table)}")
+        speed = _clamp(cur.get("speed", 3) if speed is None else speed, 1, 5)
+        brightness = _clamp(cur.get("brightness", 4) if brightness is None else brightness, 0, 4)
+        rgb = parse_hex_color(color) if color is not None else parse_hex_color(cur.get("color", "#FF0000"))
+        colorful = bool(cur.get("colorful", False) if colorful is None else colorful)
+        return mode, speed, brightness, rgb, colorful
+
+    def set_rgb(self, mode: Optional[str] = None, speed: Optional[int] = None,
+                brightness: Optional[int] = None, direction: Optional[int] = None,
+                color: Optional[str] = None, colorful: Optional[bool] = None) -> bool:
+        """Configure the key backlight. Unspecified values keep their current setting.
+
+        - mode: one of LIGHT_MODES keys
+        - speed: 1 (slow) .. 5 (fast); brightness: 0 .. 4
+        - direction (wave): 0 right, 1 left, 2 down, 3 up
+        - color: '#RRGGBB'; colorful: True = multicolour effect, False = color
         """
-        Configure keyboard RGB backlight.
-        - mode: 'off', 'static', 'breathing', 'wave', 'ripple', 'raindrop', 'snake', 'press_action', 'convergence', 'custom'
-        - speed: 1 to 5 (hardware stores: 5 - speed)
-        - brightness: 0 to 4
-        - direction: 0 (standard/right) or 1 (left)
-        - color: hex string (e.g. '#FF0000')
-        """
-        code = LIGHT_CODE_BY_KEY.get(mode.lower(), 4)  # default Wave (code 4)
-        speed = max(1, min(5, speed))
-        brightness = max(0, min(4, brightness))
-        direction = 1 if direction else 0
+        self.reload_config_if_changed()
+        mode, speed, brightness, rgb, colorful = self._resolve_led("rgb", mode, speed, brightness, color, colorful)
+        direction = _clamp(self.config.get("rgb", {}).get("direction", 0) if direction is None else direction, 0, 3)
+        frame = build_led_frame(mode, speed, brightness, direction, rgb, colorful)
+        if not self._guard(self._send, frame, pending="rgb"):
+            return False
+        self.commit({"rgb": {"mode": mode, "speed": speed, "brightness": brightness,
+                             "direction": direction, "color": format_hex_color(rgb),
+                             "colorful": colorful}})
+        return True
 
-        hw_speed = max(0, min(4, 5 - speed))
-
-        r, g, b = 255, 0, 0
-        if color:
-            color = color.lstrip("#")
-            if len(color) == 6:
-                try:
-                    r = int(color[0:2], 16)
-                    g = int(color[2:4], 16)
-                    b = int(color[4:6], 16)
-                except ValueError:
-                    pass
-
-        payload = bytearray(64)
-        payload[0] = CMD_SET_LEDPARAM
-        payload[1] = code
-        payload[2] = hw_speed
-        payload[3] = brightness
-        dazzle_flag = 8 if color else 7
-        if code == 4:  # Wave
-            payload[4] = (direction << 4) | dazzle_flag
-        else:
-            payload[4] = dazzle_flag
-        payload[5] = r
-        payload[6] = g
-        payload[7] = b
-
-        success = self._send_feature_report(payload, checksum_type="bit8")
-        if success:
-            self.config["rgb"]["mode"] = mode
-            self.config["rgb"]["speed"] = speed
-            self.config["rgb"]["brightness"] = brightness
-            self.config["rgb"]["direction"] = direction
-            if color:
-                self.config["rgb"]["color"] = f"#{r:02X}{g:02X}{b:02X}"
-            self.save_config()
-        return success
-
-    def set_side_rgb(
-        self,
-        mode: str,
-        speed: int = 3,
-        brightness: int = 4,
-        color: Optional[str] = None,
-    ) -> bool:
-        """
-        Configure side RGB LED strips.
-        - mode: 'off', 'static', 'breathing', 'wave', 'rainbow'
-        - speed: 1 to 5
-        - brightness: 0 to 4
-        - color: hex string (e.g. '#00FFCC')
-        """
-        code = SIDE_LIGHT_CODE_BY_KEY.get(mode.lower(), 3)  # default rainbow (code 3)
-        speed = max(1, min(5, speed))
-        brightness = max(0, min(4, brightness))
-
-        r, g, b = 0, 255, 204
-        if color:
-            color = color.lstrip("#")
-            if len(color) == 6:
-                try:
-                    r = int(color[0:2], 16)
-                    g = int(color[2:4], 16)
-                    b = int(color[4:6], 16)
-                except ValueError:
-                    pass
-
-        payload = bytearray(64)
-        payload[0] = CMD_SET_SLEDPARAM
-        payload[1] = code
-        payload[2] = speed
-        payload[3] = brightness
-        payload[4] = 8 if color else 7
-        payload[5] = r
-        payload[6] = g
-        payload[7] = b
-
-        success = self._send_feature_report(payload, checksum_type="bit8")
-        if success:
-            self.config["side_rgb"]["mode"] = mode
-            self.config["side_rgb"]["speed"] = speed
-            self.config["side_rgb"]["brightness"] = brightness
-            if color:
-                self.config["side_rgb"]["color"] = f"#{r:02X}{g:02X}{b:02X}"
-            self.save_config()
-        return success
+    def set_side_rgb(self, mode: Optional[str] = None, speed: Optional[int] = None,
+                     brightness: Optional[int] = None, color: Optional[str] = None,
+                     colorful: Optional[bool] = None) -> bool:
+        """Configure the side LED strips (same conventions as set_rgb)."""
+        self.reload_config_if_changed()
+        mode, speed, brightness, rgb, colorful = self._resolve_led("side_rgb", mode, speed, brightness, color, colorful)
+        frame = build_side_led_frame(mode, speed, brightness, rgb, colorful)
+        if not self._guard(self._send, frame, pending="side_rgb"):
+            return False
+        self.commit({"side_rgb": {"mode": mode, "speed": speed, "brightness": brightness,
+                                  "color": format_hex_color(rgb), "colorful": colorful}})
+        return True
 
     def set_polling_rate(self, rate_hz: int) -> bool:
         """Set keyboard polling rate: 125, 250, 500, or 1000 Hz."""
         if rate_hz not in POLLING_RATE_MAP:
             raise ValueError(f"Taux de rafraîchissement invalide: {rate_hz} Hz. Choix: 125, 250, 500, 1000.")
-
-        code = POLLING_RATE_MAP[rate_hz]
-        payload = bytearray(64)
-        payload[0] = CMD_SET_REPORT
-        payload[1] = self.config.get("profile_index", 0)
-        payload[2] = code
-
-        success = self._send_feature_report(payload, checksum_type="bit7")
-        if success:
-            self.config["polling_rate"] = rate_hz
-            self.save_config()
-        return success
+        self.reload_config_if_changed()
+        frame = build_polling_rate_frame(rate_hz, self.config.get("profile_index", 0))
+        if not self._guard(self._send, frame, DELAY_BIG, pending="polling_rate"):
+            return False
+        self.commit({"polling_rate": rate_hz})
+        return True
 
     def set_sleep_time(self, light_sleep_sec: int, deep_sleep_sec: int) -> bool:
-        """
-        Configure keyboard inactivity sleep timeouts.
-        - light_sleep_sec: light power saving (turn off LEDs), e.g. 120s (2 min)
-        - deep_sleep_sec: deep sleep (disconnect wireless radio), e.g. 1680s (28 min)
-        """
-        light_sleep_sec = max(10, min(3600, int(light_sleep_sec)))
-        deep_sleep_sec = max(60, min(86400, int(deep_sleep_sec)))
-
-        payload = bytearray(64)
-        payload[0] = CMD_SET_SLEEPTIME
-        # Checksum is placed at payload[7] (buf[8])
-        # BT light sleep (payload[8..9] / buf[9..10])
-        payload[8] = light_sleep_sec & 0xFF
-        payload[9] = (light_sleep_sec >> 8) & 0xFF
-        # 2.4G light sleep (payload[10..11] / buf[11..12])
-        payload[10] = light_sleep_sec & 0xFF
-        payload[11] = (light_sleep_sec >> 8) & 0xFF
-        # BT deep sleep (payload[12..13] / buf[13..14])
-        payload[12] = deep_sleep_sec & 0xFF
-        payload[13] = (deep_sleep_sec >> 8) & 0xFF
-        # 2.4G deep sleep (payload[14..15] / buf[15..16])
-        payload[14] = deep_sleep_sec & 0xFF
-        payload[15] = (deep_sleep_sec >> 8) & 0xFF
-
-        success = self._send_feature_report(payload, checksum_type="bit7")
-        if success:
-            self.config["sleep"]["light_sleep_sec"] = light_sleep_sec
-            self.config["sleep"]["deep_sleep_sec"] = deep_sleep_sec
-            self.save_config()
-        return success
+        """Inactivity timeouts in seconds (0 disables). Light: 60..3600, deep: 600..3600."""
+        light = int(light_sleep_sec)
+        deep = int(deep_sleep_sec)
+        light = 0 if light <= 0 else _clamp(light, *LIGHT_SLEEP_RANGE)
+        deep = 0 if deep <= 0 else _clamp(deep, *DEEP_SLEEP_RANGE)
+        if light and deep and deep < light:
+            deep = max(light, DEEP_SLEEP_RANGE[0])
+        if not self._guard(self._send, build_sleep_frame(light, deep), pending="sleep"):
+            return False
+        self.commit({"sleep": {"light_sleep_sec": light, "deep_sleep_sec": deep}})
+        return True
 
     def set_debounce(self, debounce_ms: int) -> bool:
-        """Set switch debounce filter time in ms (2 to 20 ms, default 8ms)."""
-        debounce_ms = max(2, min(20, int(debounce_ms)))
+        """Switch debounce filter in ms (2..20)."""
+        debounce_ms = _clamp(debounce_ms, *DEBOUNCE_RANGE)
+        if not self._guard(self._send, build_debounce_frame(debounce_ms), pending="debounce_ms"):
+            return False
+        self.commit({"debounce_ms": debounce_ms})
+        return True
 
-        payload = bytearray(64)
-        payload[0] = CMD_SET_DEBOUNCE
-        payload[1] = self.config.get("profile_index", 0)
-        payload[2] = debounce_ms
+    def read_options(self) -> Optional[Tuple[int, int, int]]:
+        """Read (options, fn, power) bytes from the keyboard, or None if unavailable."""
+        try:
+            data = self._query(CMD_GET_KBOPTION, self.config.get("profile_index", 0))
+        except DeviceError:
+            return None
+        if len(data) < 5 or data[0] != CMD_GET_KBOPTION:
+            return None
+        current = (data[2], data[3], data[4])
+        if self.config.get("options_raw") != list(current):
+            self.commit({"options_raw": list(current)})
+        return current
 
-        success = self._send_feature_report(payload, checksum_type="bit7")
-        if success:
-            self.config["debounce_ms"] = debounce_ms
-            self.save_config()
-        return success
+    def _known_options(self) -> Tuple[int, int, int]:
+        """Last option bytes known: read live (cable), else the ones saved
+        from the last cable connection, so wireless writes keep them."""
+        live = self.read_options()
+        if live:
+            return live
+        if self._options_cache:
+            return self._options_cache
+        raw = self.config.get("options_raw")
+        if isinstance(raw, list) and len(raw) == 3 and all(isinstance(b, int) and 0 <= b <= 255 for b in raw):
+            return tuple(raw)
+        return (0, 0, 0)
 
-    def set_keyboard_options(
-        self,
-        win_lock: Optional[bool] = None,
-        wasd_swap: Optional[bool] = None,
-        os_mode: Optional[str] = None,
-        gaming_mode: Optional[bool] = None,
-    ) -> bool:
+    def set_keyboard_options(self, win_lock: Optional[bool] = None, wasd_swap: Optional[bool] = None,
+                             os_mode: Optional[str] = None, gaming_mode: Optional[bool] = None) -> bool:
+        """Win lock, WASD/arrows swap, OS mode ('win'/'mac') and gaming mode.
+
+        Option bits we do not manage (LED off, keyboard lock, Fn matrix, power
+        saving) are read back from the keyboard first and preserved.
         """
-        Configure keyboard firmware options:
-        - win_lock: Lock Windows key
-        - wasd_swap: Swap WASD and arrow keys
-        - os_mode: 'win', 'mac', 'ios', 'android'
-        - gaming_mode: High performance gaming mode
-        """
+        self.reload_config_if_changed()
         opts = self.config.get("options", {})
-        cur_win_lock = opts.get("win_lock", False) if win_lock is None else win_lock
-        cur_wasd_swap = opts.get("wasd_swap", False) if wasd_swap is None else wasd_swap
-        cur_os_mode = opts.get("os_mode", "win") if os_mode is None else os_mode
-        cur_gaming_mode = opts.get("gaming_mode", False) if gaming_mode is None else gaming_mode
+        win_lock = opts.get("win_lock", False) if win_lock is None else bool(win_lock)
+        wasd_swap = opts.get("wasd_swap", False) if wasd_swap is None else bool(wasd_swap)
+        gaming_mode = opts.get("gaming_mode", False) if gaming_mode is None else bool(gaming_mode)
+        os_mode = (opts.get("os_mode", "win") if os_mode is None else str(os_mode)).lower()
+        if os_mode not in OS_MODES:
+            raise ValueError(f"Mode système non pris en charge par le K20: {os_mode} (choix: win, mac)")
 
-        os_val = {"win": 0, "mac": 1, "ios": 2, "android": 3}.get(cur_os_mode.lower(), 0)
-
-        # Build bitfield byte:
-        # bit 0: winKeyLock
-        # bit 1..2: OS mode
-        # bit 3: wasdKeyAndArrowKeyExchange
-        # bit 4: ledOff
-        # bit 5: sLedOff
-        # bit 6: keyboardMode (0=normal, 1=gaming)
-        bitfield = 0
-        if cur_win_lock:
-            bitfield |= (1 << 0)
-        bitfield |= (os_val & 0x03) << 1
-        if cur_wasd_swap:
-            bitfield |= (1 << 3)
-        if cur_gaming_mode:
-            bitfield |= (1 << 6)
-
-        payload = bytearray(64)
-        payload[0] = CMD_SET_KBOPTION
-        payload[1] = self.config.get("profile_index", 0)
-        payload[2] = bitfield
-
-        success = self._send_feature_report(payload, checksum_type="bit7")
-        if success:
-            self.config["options"]["win_lock"] = cur_win_lock
-            self.config["options"]["wasd_swap"] = cur_wasd_swap
-            self.config["options"]["os_mode"] = cur_os_mode
-            self.config["options"]["gaming_mode"] = cur_gaming_mode
-            self.save_config()
-        return success
+        current = self._known_options()
+        options_byte = encode_options(current[0], win_lock, wasd_swap, os_mode, gaming_mode)
+        frame = build_options_frame(options_byte, current[1], current[2], self.config.get("profile_index", 0))
+        if not self._guard(self._send, frame, pending="options"):
+            return False
+        self._options_cache = (options_byte, current[1], current[2])
+        self.commit({"options": {"win_lock": win_lock, "wasd_swap": wasd_swap,
+                                 "os_mode": os_mode, "gaming_mode": gaming_mode},
+                     "options_raw": list(self._options_cache)})
+        return True
 
     def set_profile(self, profile_idx: int) -> bool:
-        """Switch hardware profile (0, 1, or 2)."""
-        profile_idx = max(0, min(2, int(profile_idx)))
+        """Switch the on-board hardware profile (0, 1 or 2)."""
+        profile_idx = int(profile_idx)
+        if not 0 <= profile_idx < PROFILE_COUNT:
+            raise ValueError(f"Profil matériel invalide: {profile_idx} (0 à {PROFILE_COUNT - 1}).")
+        if not self._guard(self._send, build_simple_frame(CMD_SET_PROFILE, profile_idx), DELAY_BIG,
+                           pending="profile_index"):
+            return False
+        self.commit({"profile_index": profile_idx})
+        return True
 
-        payload = bytearray(64)
-        payload[0] = CMD_SET_PROFILE
-        payload[1] = profile_idx
+    def _action_bytes(self, key: Dict[str, Any], action_key: str, fn_layer: bool) -> List[int]:
+        if action_key not in REMAP_ACTIONS:
+            raise ValueError(f"Action inconnue: {action_key}. Choix: {', '.join(REMAP_ACTIONS)}")
+        if action_key == "default":
+            idx = KEY_MATRIX_INDEX[key["name"]]
+            return _matrix_entry(DEFAULT_FN_MATRIX if fn_layer else DEFAULT_MATRIX, idx)
+        return list(REMAP_ACTIONS[action_key][1])
 
-        success = self._send_feature_report(payload, checksum_type="bit7")
-        if success:
-            self.config["profile_index"] = profile_idx
-            self.save_config()
-        return success
+    def _remap(self, key_name: str, action_key: str, profile_idx: Optional[int], fn_layer: bool) -> bool:
+        key = _key_by_name(key_name)
+        if key["name"] not in KEY_MATRIX_INDEX:
+            raise ValueError(f"La touche {key['name']} ne peut pas être remappée.")
+        action = self._action_bytes(key, action_key, fn_layer)
+        self.reload_config_if_changed()
+        if profile_idx is None:
+            profile_idx = self.config.get("profile_index", 0)
+        cmd = CMD_SET_FN_SIMPLE if fn_layer else CMD_SET_KEYMATRIX_SIMPLE
+        frame = build_key_frame(cmd, int(profile_idx), KEY_MATRIX_INDEX[key["name"]], action)
+        section = "fn_remaps" if fn_layer else "key_remaps"
+        if not self._guard(self._send, frame, DELAY_KEY, pending=f"{section}:{key['name']}"):
+            return False
 
-    def remap_key(self, key_name: str, action_key: str, profile_idx: int = 0) -> bool:
-        """
-        Remap a standard key.
-        - key_name: Name of key in KEY_LAYOUT (e.g. 'F1', 'Esc', 'Q', 'Caps Lock')
-        - action_key: Key in REMAP_ACTIONS (e.g. 'media_vol_up', 'mouse_left', 'copy', etc.)
-        """
-        # Find key index in KEY_LAYOUT
-        key_idx = None
-        for idx, k in enumerate(KEY_LAYOUT):
-            if k["name"].lower() == key_name.lower():
-                key_idx = idx
-                break
+        def mutate(cfg):
+            remaps = cfg.setdefault(section, {})
+            if action_key == "default":
+                remaps.pop(key["name"], None)
+            else:
+                remaps[key["name"]] = action_key
+        self.update_config(mutate)
+        return True
 
-        if key_idx is None:
-            raise ValueError(f"Touche inconnue: {key_name}")
+    def remap_key(self, key_name: str, action_key: str, profile_idx: Optional[int] = None) -> bool:
+        """Remap a key of the base layer ('default' restores its factory action)."""
+        return self._remap(key_name, action_key, profile_idx, fn_layer=False)
 
-        action_bytes = REMAP_ACTIONS.get(action_key, ("Désactivé", [0, 0, 0, 0]))[1]
-
-        payload = bytearray(64)
-        payload[0] = CMD_SET_KEYMATRIX_SIMPLE
-        payload[1] = profile_idx
-        payload[2] = key_idx
-        # Checksum is computed into payload[7] (buf[8])
-        # Action frame at payload[8..11] (buf[9..12])
-        payload[8] = action_bytes[0]
-        payload[9] = action_bytes[1]
-        payload[10] = action_bytes[2]
-        payload[11] = action_bytes[3]
-
-        success = self._send_feature_report(payload, checksum_type="bit7")
-        if success:
-            self.config.setdefault("key_remaps", {})[key_name] = action_key
-            self.save_config()
-        return success
-
-    def remap_fn_key(self, key_name: str, action_key: str, profile_idx: int = 0) -> bool:
-        """
-        Remap a Fn-layer key combination.
-        - key_name: Name of key in KEY_LAYOUT
-        - action_key: Key in REMAP_ACTIONS
-        """
-        key_idx = None
-        for idx, k in enumerate(KEY_LAYOUT):
-            if k["name"].lower() == key_name.lower():
-                key_idx = idx
-                break
-
-        if key_idx is None:
-            raise ValueError(f"Touche inconnue: {key_name}")
-
-        action_bytes = REMAP_ACTIONS.get(action_key, ("Désactivé", [0, 0, 0, 0]))[1]
-
-        payload = bytearray(64)
-        payload[0] = CMD_SET_FN_SIMPLE
-        payload[1] = profile_idx
-        payload[2] = key_idx
-        # Checksum is computed into payload[7] (buf[8])
-        # Action frame at payload[8..11] (buf[9..12])
-        payload[8] = action_bytes[0]
-        payload[9] = action_bytes[1]
-        payload[10] = action_bytes[2]
-        payload[11] = action_bytes[3]
-
-        success = self._send_feature_report(payload, checksum_type="bit7")
-        if success:
-            self.config.setdefault("fn_remaps", {})[key_name] = action_key
-            self.save_config()
-        return success
+    def remap_fn_key(self, key_name: str, action_key: str, profile_idx: Optional[int] = None) -> bool:
+        """Remap Fn + key ('default' restores its factory action)."""
+        return self._remap(key_name, action_key, profile_idx, fn_layer=True)
 
     def factory_reset(self) -> bool:
-        """Restore keyboard to factory default settings."""
-        payload = bytearray(64)
-        payload[0] = CMD_SET_RESERT
-        success = self._send_feature_report(payload, checksum_type="bit7")
-        if success:
-            self.config = self._default_config()
-            self.save_config()
-        return success
+        """Restore the keyboard to factory settings."""
+        if not self._guard(self._send, build_simple_frame(CMD_SET_RESERT), DELAY_BIG * 2):
+            return False
+        self._options_cache = None
+        self.update_config(lambda cfg: (cfg.clear(), cfg.update(self.default_config())))  # also drops pending_sync
+        return True
+
+    def get_firmware_version(self) -> Optional[int]:
+        try:
+            data = self._query(CMD_GET_REV)
+        except DeviceError:
+            return None
+        if len(data) < 3 or data[0] != CMD_GET_REV:
+            return None
+        return data[1] | (data[2] << 8)
 
     def get_battery(self) -> Dict[str, Any]:
-        """Query real-time battery status and charging state via hardware feature reports."""
-        # Check if connected
+        """Battery status, only known over the 2.4GHz receiver (byte 1 of its
+        0xF7 status); over the cable the keyboard is charging."""
         if not self.is_connected():
-            return {
-                "percentage": None,
-                "charging": False,
-                "connected": False,
-                "wireless": False,
-                "status_str": "Non connecté",
-            }
-
-        is_wl = self.is_wireless()
-
-        # In wired mode, the keyboard is powered and charging via USB-C
-        if not is_wl:
-            return {
-                "percentage": 100,
-                "charging": True,
-                "connected": True,
-                "wireless": False,
-                "status_str": "En charge (Câblé USB)",
-            }
-
-        # In wireless mode (2.4GHz dongle / Bluetooth), query device via HIDIOCSFEATURE + HIDIOCGFEATURE
-        buf = self._read_feature_report(CMD_GET_BATTERY)
-        if buf is None:
-            return {
-                "percentage": None,
-                "charging": False,
-                "connected": True,
-                "wireless": True,
-                "status_str": "Erreur de communication (sans-fil)",
-            }
-
-        # Protocol reverse-engineered from iot_driver.exe / Electron client:
-        # Buffer layout returned by firmware:
-        # buf[0]: Report ID (0x00)
-        # buf[1]: Command echo (CMD_GET_BATTERY = 0x83) OR battery percentage
-        # If buf[1] == CMD_GET_BATTERY:
-        #   buf[2] = battery percentage (0-100)
-        #   buf[3] = charging state (1: charging, 2: full, other: discharging)
-        #   buf[4] = low power threshold
-        # If buf[1] != CMD_GET_BATTERY and 1 <= buf[1] <= 100:
-        #   buf[1] = battery percentage
-        #   buf[2] = charging state
-        percentage = None
-        charging = False
-        state_byte = 0
-
-        if buf[1] == CMD_GET_BATTERY:
-            raw_pct = buf[2]
-            state_byte = buf[3]
-            if 0 < raw_pct <= 100:
-                percentage = raw_pct
-        elif 0 < buf[1] <= 100:
-            percentage = buf[1]
-            state_byte = buf[2]
-
-        if percentage is not None:
-            if state_byte == 1:
-                charging = True
-                status_str = f"En charge ({percentage}%)"
-            elif state_byte == 2:
-                charging = False
-                status_str = f"Batterie pleine ({percentage}%)"
-            else:
-                charging = False
-                status_str = f"{percentage}% (Sans-fil 2.4GHz)"
-
-            return {
-                "percentage": percentage,
-                "charging": charging,
-                "connected": True,
-                "wireless": True,
-                "status_str": status_str,
-            }
-
-        # If the response is all zeros or unpopulated (e.g. keyboard asleep / dongle telemetry pending),
-        # return percentage=None with an explicit status message rather than a fabricated fallback.
-        # TODO: The 2.4GHz dongle (PID 4011) may require a specific vendor wake sequence
-        # (e.g. 0xFE length handshake or 0xF7 polling) to populate battery telemetry across the RF link.
-        return {
-            "percentage": None,
-            "charging": False,
-            "connected": True,
-            "wireless": True,
-            "status_str": "Lecture batterie non implémentée (sans-fil)",
-        }
-
-    def apply_profile(self, profile: Dict[str, Any]) -> bool:
-        """Apply a complete configuration profile to the hardware."""
-        success = True
+            return {"percentage": None, "charging": False, "connected": False,
+                    "wireless": False, "status_str": "Non connecté"}
+        wireless = self.is_wireless()
+        if not wireless:
+            return {"percentage": None, "charging": True, "connected": True,
+                    "wireless": False, "status_str": "Câblé USB (en charge)"}
         try:
-            if "polling_rate" in profile:
-                self.set_polling_rate(profile["polling_rate"])
-            if "debounce_ms" in profile:
-                self.set_debounce(profile["debounce_ms"])
-            if "sleep" in profile:
-                s = profile["sleep"]
-                self.set_sleep_time(s.get("light_sleep_sec", 120), s.get("deep_sleep_sec", 1680))
-            if "options" in profile:
-                o = profile["options"]
-                self.set_keyboard_options(
-                    win_lock=o.get("win_lock"),
-                    wasd_swap=o.get("wasd_swap"),
-                    os_mode=o.get("os_mode"),
-                    gaming_mode=o.get("gaming_mode"),
-                )
-            if "rgb" in profile:
-                r = profile["rgb"]
-                self.set_rgb(
-                    mode=r.get("mode", "wave"),
-                    speed=r.get("speed", 3),
-                    brightness=r.get("brightness", 4),
-                    direction=r.get("direction", 0),
-                    color=r.get("color"),
-                )
-            if "side_rgb" in profile:
-                sr = profile["side_rgb"]
-                self.set_side_rgb(
-                    mode=sr.get("mode", "rainbow"),
-                    speed=sr.get("speed", 3),
-                    brightness=sr.get("brightness", 4),
-                    color=sr.get("color"),
-                )
-            # Merge into current config
-            self._deep_merge(self.config, profile)
-            self.save_config()
-        except Exception as e:
-            print(f"Erreur lors de l'application du profil: {e}", file=sys.stderr)
-            success = False
-        return success
+            self._wait_command_gap(getattr(self, "_pending_gap", 0.0))
+            with self.open_device() as dev:
+                status = self._rf_status(dev)
+        except DeviceError as e:
+            return {"percentage": None, "charging": False, "connected": True,
+                    "wireless": True, "status_str": f"Erreur de communication ({e})"}
+        # Receiver status [busy, battery %, ...]: the same value the vendor
+        # software polls every 2 s.
+        if len(status) > RF_STATUS_BATTERY and 1 <= status[RF_STATUS_BATTERY] <= 100:
+            pct = status[RF_STATUS_BATTERY]
+            return {"percentage": pct, "charging": False, "connected": True,
+                    "wireless": True, "status_str": f"{pct}%"}
+        return {"percentage": None, "charging": False, "connected": True, "wireless": True,
+                "status_str": "Niveau de batterie non communiqué par le clavier"}
+
+    # ------------------------------------------------------------------
+    # Profiles
+    # ------------------------------------------------------------------
+    def apply_profile(self, profile: Dict[str, Any]) -> bool:
+        """Apply a complete profile; returns True only if every step succeeded.
+
+        Remaps present in the previous state but absent from the profile are
+        restored to their factory action so profiles never leak into each other.
+        """
+        self.reload_config_if_changed()
+        errors: List[str] = []
+
+        def step(label, func, *args, **kwargs):
+            try:
+                if not func(*args, **kwargs):
+                    errors.append(label)
+            except (ValueError, TypeError, KeyError) as e:
+                errors.append(f"{label} ({e})")
+
+        if "polling_rate" in profile:
+            step("taux de rafraîchissement", self.set_polling_rate, profile["polling_rate"])
+        if "debounce_ms" in profile:
+            step("anti-rebond", self.set_debounce, profile["debounce_ms"])
+        if isinstance(profile.get("sleep"), dict):
+            s = profile["sleep"]
+            step("veille", self.set_sleep_time, s.get("light_sleep_sec", 120), s.get("deep_sleep_sec", 1680))
+        if isinstance(profile.get("options"), dict):
+            o = profile["options"]
+            step("options", self.set_keyboard_options, win_lock=o.get("win_lock"),
+                 wasd_swap=o.get("wasd_swap"), os_mode=o.get("os_mode"), gaming_mode=o.get("gaming_mode"))
+        if isinstance(profile.get("rgb"), dict):
+            r = profile["rgb"]
+            step("éclairage", self.set_rgb, mode=r.get("mode", "wave"), speed=r.get("speed", 3),
+                 brightness=r.get("brightness", 4), direction=r.get("direction", 0),
+                 color=r.get("color"), colorful=r.get("colorful", r.get("mode", "wave") == "wave"))
+        if isinstance(profile.get("side_rgb"), dict):
+            sr = profile["side_rgb"]
+            step("éclairage latéral", self.set_side_rgb, mode=sr.get("mode", "rainbow"),
+                 speed=sr.get("speed", 3), brightness=sr.get("brightness", 4),
+                 color=sr.get("color"), colorful=sr.get("colorful", False))
+
+        for section, fn_layer in (("key_remaps", False), ("fn_remaps", True)):
+            wanted = profile.get(section)
+            if not isinstance(wanted, dict):
+                continue
+            current = dict(self.config.get(section, {}))
+            for key_name in current:
+                if key_name not in wanted:
+                    step(f"restauration {key_name}", self._remap, key_name, "default", None, fn_layer)
+            for key_name, action in wanted.items():
+                if current.get(key_name) != action:
+                    step(f"remappage {key_name}", self._remap, key_name, action, None, fn_layer)
+
+        if errors:
+            self.last_error = "Échec: " + ", ".join(errors)
+            return False
+        return True
 
 
 if __name__ == "__main__":
@@ -1027,7 +1167,5 @@ if __name__ == "__main__":
     print(f"Device Node: {driver.dev_path}")
     print(f"Connected: {driver.is_connected()}")
     print(f"Wireless: {driver.is_wireless()}")
+    print("Firmware:", driver.get_firmware_version())
     print("Battery:", driver.get_battery())
-    print("Testing RGB Wave...")
-    res = driver.set_rgb("wave", speed=3, brightness=4)
-    print("RGB Wave result:", res)
